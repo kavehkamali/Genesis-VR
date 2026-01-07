@@ -1,0 +1,62 @@
+# --- Byte-compiled / optimized / DLL files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Environments & Packages ---
+.venv/
+venv/
+env/
+bin/
+lib/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- PyTorch / Deep Learning Specifics ---
+# Large model weights (Checkpoints)
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.weights
+*.onnx
+
+# Datasets (Local data storage)
+data/
+datasets/
+raw_data/
+
+# --- Experiment Tracking & Logs ---
+runs/
+logs/
+.tensorboard/
+mlruns/
+wandb/
+lightning_logs/
+
+# --- Jupyter Notebooks ---
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# --- OS & IDE Specific ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Environment Variables ---
+.env
