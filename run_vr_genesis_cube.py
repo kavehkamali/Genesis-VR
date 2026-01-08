@@ -27,15 +27,21 @@ from OpenGL import WGL
 # ==========================================================
 # USER TUNABLES
 # ==========================================================
-WORLD_T = (0.0, -1.2, 0.0)
-MAPPING = "A"
+WORLD_T = (0.0, -1.2, 0.0)          # your working placement
+MAPPING = "A"                       # your working mapping
 FLIP_IMAGE_VERTICAL = True
 
-RENDER_SCALE = 1.0           # try 0.6 if still laggy
-EYE_SEP_SCALE = 7.0        # stereo comfort hack
-SWAP_EYES = False            # if eyes are swapped
+RENDER_SCALE = 1.0                  # 0.6–1.0 (lower = faster, less lag)
+TARGET_RENDER_HZ = 72               # worker render pacing (72/80/90)
 
-# Try to reduce Genesis logging without breaking encoding
+EYE_SEP_SCALE = 7.0                 # stereo comfort: try 0.9..1.1, NOT 7.0
+SWAP_EYES = False
+
+# smoothing (bigger = smoother but more lag)
+POSE_SMOOTH_POS = 0.65              # 0..1  (0=no smoothing, 0.6..0.8 good)
+POSE_SMOOTH_ROT = 0.65              # 0..1
+
+# reduce Genesis logs
 SILENCE_GENESIS_LOGS = True
 
 
@@ -75,6 +81,40 @@ def shm_view_rgb(shm: SharedMemory, w: int, h: int) -> np.ndarray:
 # Math helpers
 # ==========================================================
 
+def normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v)) + 1e-9
+    return v / n
+
+
+def quat_normalize(q):
+    q = np.asarray(q, dtype=np.float32)
+    return q / (np.linalg.norm(q) + 1e-9)
+
+
+def quat_dot(a, b):
+    return float(np.dot(a, b))
+
+
+def quat_slerp(q0, q1, t: float):
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+
+    # shortest path
+    if quat_dot(q0, q1) < 0.0:
+        q1 = -q1
+
+    dot = np.clip(quat_dot(q0, q1), -1.0, 1.0)
+
+    if dot > 0.9995:
+        return quat_normalize(q0 + t * (q1 - q0))
+
+    theta_0 = math.acos(dot)
+    theta = theta_0 * t
+    s0 = math.sin(theta_0 - theta) / math.sin(theta_0)
+    s1 = math.sin(theta) / math.sin(theta_0)
+    return quat_normalize((s0 * q0) + (s1 * q1))
+
+
 def quat_to_rotmat_xyzw(qx, qy, qz, qw) -> np.ndarray:
     x, y, z, w = qx, qy, qz, qw
     return np.array(
@@ -88,18 +128,13 @@ def quat_to_rotmat_xyzw(qx, qy, qz, qw) -> np.ndarray:
 
 
 def xr_basis_from_quat(q_xyzw):
-    # OpenXR local axes: right=+X, up=+Y, forward=-Z
+    # OpenXR: right=+X, up=+Y, forward=-Z
     qx, qy, qz, qw = q_xyzw
     R = quat_to_rotmat_xyzw(qx, qy, qz, qw)
     right = R[:, 0]
     up = R[:, 1]
     forward = -R[:, 2]
     return right.astype(np.float32), up.astype(np.float32), forward.astype(np.float32)
-
-
-def normalize(v):
-    n = float(np.linalg.norm(v)) + 1e-9
-    return v / n
 
 
 def map_vec_xr_to_gen(v):
@@ -121,19 +156,12 @@ def map_pos_xr_to_gen(p_xyz, world_t=WORLD_T):
 # ==========================================================
 
 def _force_utf8_stdio():
-    """
-    Avoid UnicodeEncodeError from Genesis banner (box-drawing chars) in some shells.
-    """
     try:
-        # Python 3.7+: reconfigure encoding
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    try:
-        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-    except Exception:
-        pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
 def _to_uint8_rgb(img):
@@ -189,23 +217,24 @@ def genesis_worker(meta: ShmStereoTB,
         _force_utf8_stdio()
 
         if SILENCE_GENESIS_LOGS:
-            # Best effort env toggles; harmless if ignored by Genesis
-            os.environ.setdefault("GENESIS_LOG_LEVEL", "ERROR")
-            os.environ.setdefault("GSTAI_LOG_LEVEL", "ERROR")
-            os.environ.setdefault("GLOG_minloglevel", "2")
-
-        import logging
-        logging.getLogger().setLevel(logging.ERROR)
-        for name in ["genesis", "gstaichi", "taichi"]:
-            logging.getLogger(name).setLevel(logging.ERROR)
+            import logging
+            logging.getLogger().handlers.clear()
+            logging.getLogger().setLevel(logging.ERROR)
+            for name in ["genesis", "gstaichi", "taichi"]:
+                logging.getLogger(name).setLevel(logging.ERROR)
 
         import genesis as gs
+
+        # IMPORTANT: Genesis supports logging_level in gs.init() :contentReference[oaicite:2]{index=2}
+        if SILENCE_GENESIS_LOGS:
+            gs.init(backend=gs.cpu, logging_level="error")
+        else:
+            gs.init(backend=gs.cpu)
 
         shms = shm_attach_triple(meta)
         L = [shm_view_rgb(shms[i], meta.w, meta.h) for i in range(3)]
         R = [shm_view_rgb(shms[i+3], meta.w, meta.h) for i in range(3)]
 
-        gs.init(backend=gs.cpu)
         scene = gs.Scene(show_viewer=False, renderer=gs.renderers.Rasterizer())
 
         # Ring plate + cube
@@ -234,42 +263,66 @@ def genesis_worker(meta: ShmStereoTB,
                                               pos=(0.30, 0.0, ring_z + 0.25),
                                               fixed=False))
 
-        cam = [
-            scene.add_camera(res=(meta.w, meta.h), pos=(1.2, -0.03, 1.0), lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False),
-            scene.add_camera(res=(meta.w, meta.h), pos=(1.2, +0.03, 1.0), lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False),
-        ]
+        camL = scene.add_camera(res=(meta.w, meta.h), pos=(1.2, -0.03, 1.0),
+                                lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False)
+        camR = scene.add_camera(res=(meta.w, meta.h), pos=(1.2, +0.03, 1.0),
+                                lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False)
 
         scene.build()
         status_queue.put({"ok": True, "msg": "Genesis worker ready"})
 
+        # latest inputs
         grip = False
         trigger = 0.0
         hand_pos = None
-        eye_pose = [None, None]
+
+        head_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        head_q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        ipd = 0.064  # default fallback meters
+
+        have_pose = False
         want_seq = -1
 
+        # smoothed state
+        head_pos_s = head_pos.copy()
+        head_q_s = head_q.copy()
+
         next_write = 0
+        dt_target = 1.0 / max(10.0, float(TARGET_RENDER_HZ))
+        t_next = time.perf_counter()
 
         while not stop_event.is_set():
+            # non-blocking drain: ALWAYS render at steady rate (prevents "jump every 0.05s")
+            got_any = False
             try:
-                msg = ctrl_queue.get(timeout=0.05)
+                while True:
+                    msg = ctrl_queue.get_nowait()
+                    if msg is None:
+                        continue
+                    got_any = True
+                    seq = int(msg.get("seq", -1))
+                    if seq == want_seq:
+                        continue
+                    want_seq = seq
+
+                    grip = bool(msg.get("grip", grip))
+                    trigger = float(msg.get("trigger", trigger))
+
+                    hp = msg.get("hand_pos", None)
+                    hand_pos = tuple(hp) if hp is not None else None
+
+                    hp2 = msg.get("head_pos", None)
+                    hq2 = msg.get("head_q", None)
+                    ipd2 = msg.get("ipd", None)
+
+                    if hp2 is not None and hq2 is not None:
+                        head_pos = np.array(hp2, dtype=np.float32)
+                        head_q = np.array(hq2, dtype=np.float32)
+                        have_pose = True
+                    if ipd2 is not None:
+                        ipd = float(ipd2)
             except Exception:
-                continue
-            if msg is None:
-                continue
-
-            seq = int(msg.get("seq", -1))
-            if seq == want_seq:
-                continue
-            want_seq = seq
-
-            grip = bool(msg.get("grip", grip))
-            trigger = float(msg.get("trigger", trigger))
-            hp = msg.get("hand_pos", None)
-            hand_pos = tuple(hp) if hp is not None else None
-            ep = msg.get("eye_pose", None)
-            if ep is not None:
-                eye_pose = ep
+                pass
 
             # cube control
             if grip and hand_pos is not None:
@@ -282,41 +335,46 @@ def genesis_worker(meta: ShmStereoTB,
 
             scene.step()
 
-            # scale eye separation about head center
-            head = None
-            if eye_pose[0] is not None and eye_pose[1] is not None:
-                p0 = np.array(eye_pose[0]["p"], dtype=np.float32)
-                p1 = np.array(eye_pose[1]["p"], dtype=np.float32)
-                head = 0.5 * (p0 + p1)
+            # head pose smoothing (reduces jitter at cost of a bit of latency)
+            if have_pose:
+                # position EMA
+                head_pos_s = (POSE_SMOOTH_POS * head_pos_s) + ((1.0 - POSE_SMOOTH_POS) * head_pos)
 
-            for i in (0, 1):
-                if eye_pose[i] is None:
-                    continue
-                px, py, pz = eye_pose[i]["p"]
-                qx, qy, qz, qw = eye_pose[i]["q"]
+                # rotation slerp smoothing toward newest
+                head_q_s = quat_slerp(head_q_s, head_q, 1.0 - POSE_SMOOTH_ROT)
 
-                if head is not None:
-                    pi = np.array([px, py, pz], dtype=np.float32)
-                    pi = head + EYE_SEP_SCALE * (pi - head)
-                    px, py, pz = float(pi[0]), float(pi[1]), float(pi[2])
-
-                _, up, forward = xr_basis_from_quat((qx, qy, qz, qw))
+                # build Genesis L/R cameras from ONE shared orientation + IPD baseline
+                right, up, forward = xr_basis_from_quat(head_q_s)
                 g_forward = normalize(map_vec_xr_to_gen(forward))
                 g_up = normalize(map_vec_xr_to_gen(up))
+                g_right = normalize(map_vec_xr_to_gen(right))
 
-                gpos = map_pos_xr_to_gen((px, py, pz), world_t=WORLD_T)
-                lookat = (gpos[0] + float(g_forward[0]),
-                          gpos[1] + float(g_forward[1]),
-                          gpos[2] + float(g_forward[2]))
-                gup = (float(g_up[0]), float(g_up[1]), float(g_up[2]))
+                # map head position to Genesis space
+                g_head = np.array(map_pos_xr_to_gen(head_pos_s, world_t=WORLD_T), dtype=np.float32)
 
-                _cam_set_pose(cam[i], pos=gpos, lookat=lookat, up=gup)
+                half_sep = 0.5 * ipd * float(EYE_SEP_SCALE)
+                g_L = g_head - g_right * half_sep
+                g_R = g_head + g_right * half_sep
 
+                lookL = g_L + g_forward
+                lookR = g_R + g_forward
+
+                _cam_set_pose(camL,
+                             pos=(float(g_L[0]), float(g_L[1]), float(g_L[2])),
+                             lookat=(float(lookL[0]), float(lookL[1]), float(lookL[2])),
+                             up=(float(g_up[0]), float(g_up[1]), float(g_up[2])))
+
+                _cam_set_pose(camR,
+                             pos=(float(g_R[0]), float(g_R[1]), float(g_R[2])),
+                             lookat=(float(lookR[0]), float(lookR[1]), float(lookR[2])),
+                             up=(float(g_up[0]), float(g_up[1]), float(g_up[2])))
+
+            # render
             write_idx = next_write % 3
             next_write += 1
 
-            rgb0 = _render_rgb(cam[0])
-            rgb1 = _render_rgb(cam[1])
+            rgb0 = _render_rgb(camL)
+            rgb1 = _render_rgb(camR)
 
             if FLIP_IMAGE_VERTICAL:
                 if rgb0 is not None:
@@ -333,6 +391,16 @@ def genesis_worker(meta: ShmStereoTB,
                 published_idx.value = write_idx
             with published_seq.get_lock():
                 published_seq.value = want_seq
+
+            # steady pacing
+            t_now = time.perf_counter()
+            t_next += dt_target
+            sleep_s = t_next - t_now
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                # we're late; reset to avoid runaway drift
+                t_next = t_now
 
         try:
             scene.destroy()
@@ -439,7 +507,7 @@ class FullscreenBlitter:
 # ==========================================================
 
 class XrRuntime:
-    def __init__(self, title="VR Genesis Stable UTF8"):
+    def __init__(self, title="VR Genesis Stable"):
         if platform.system() != "Windows":
             raise RuntimeError("Windows-only (WGL + SDL).")
 
@@ -453,14 +521,16 @@ class XrRuntime:
         if req not in avail:
             raise RuntimeError("XR_KHR_opengl_enable not available")
 
-        app_info = xr.ApplicationInfo("vr_genesis_stable_utf8", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
+        app_info = xr.ApplicationInfo("vr_genesis_stable", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
         self.instance = xr.create_instance(
             xr.InstanceCreateInfo(application_info=app_info, enabled_extension_names=[req])
         )
 
         self.system_id = xr.get_system(self.instance, xr.SystemGetInfo(xr.FormFactor.HEAD_MOUNTED_DISPLAY))
         self.view_config_type = xr.ViewConfigurationType.PRIMARY_STEREO
-        self.view_config_views = xr.enumerate_view_configuration_views(self.instance, self.system_id, self.view_config_type)
+        self.view_config_views = xr.enumerate_view_configuration_views(
+            self.instance, self.system_id, self.view_config_type
+        )
 
         if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
             raise RuntimeError("SDL_Init failed")
@@ -509,6 +579,7 @@ class XrRuntime:
 
         identity = xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1), position=xr.Vector3f(0, 0, 0))
 
+        # Prefer STAGE for stable "world locked" if available
         try:
             self.reference_space = xr.create_reference_space(
                 self.session,
@@ -646,6 +717,7 @@ class XrRuntime:
             except Exception:
                 pass
 
+            # --- controller ---
             grip = False
             trigger = 0.0
             hand_pos = None
@@ -664,6 +736,7 @@ class XrRuntime:
             except Exception:
                 pass
 
+            # --- views ---
             try:
                 _, located_views = xr.locate_views(
                     self.session,
@@ -677,12 +750,21 @@ class XrRuntime:
                                                            layers=[]))
                 continue
 
-            eye_pose = []
-            for i in (0, 1):
-                p = located_views[i].pose.position
-                q = located_views[i].pose.orientation
-                eye_pose.append({"p": (float(p.x), float(p.y), float(p.z)),
-                                 "q": (float(q.x), float(q.y), float(q.z), float(q.w))})
+            # compute head pose + ipd from eyes
+            p0 = located_views[0].pose.position
+            p1 = located_views[1].pose.position
+            q0 = located_views[0].pose.orientation
+            q1 = located_views[1].pose.orientation
+
+            eye0 = np.array([float(p0.x), float(p0.y), float(p0.z)], dtype=np.float32)
+            eye1 = np.array([float(p1.x), float(p1.y), float(p1.z)], dtype=np.float32)
+            head_pos = 0.5 * (eye0 + eye1)
+            ipd = float(np.linalg.norm(eye1 - eye0))
+
+            qq0 = np.array([float(q0.x), float(q0.y), float(q0.z), float(q0.w)], dtype=np.float32)
+            qq1 = np.array([float(q1.x), float(q1.y), float(q1.z), float(q1.w)], dtype=np.float32)
+            # average orientation (slerp 50/50)
+            head_q = quat_slerp(qq0, qq1, 0.5)
 
             seq += 1
             send_to_worker(
@@ -690,7 +772,9 @@ class XrRuntime:
                 grip=grip,
                 trigger=trigger,
                 hand_pos=list(hand_pos) if hand_pos is not None else None,
-                eye_pose=eye_pose,
+                head_pos=[float(head_pos[0]), float(head_pos[1]), float(head_pos[2])],
+                head_q=[float(head_q[0]), float(head_q[1]), float(head_q[2]), float(head_q[3])],
+                ipd=ipd,
             )
 
             rgb_left, rgb_right = get_tb_frames(seq)
@@ -753,7 +837,14 @@ class XrRuntime:
 def main():
     mp.set_start_method("spawn", force=True)
 
-    rt = XrRuntime("VR Genesis Stable UTF8")
+    # (optional) reduce unicode issues in main too
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    rt = XrRuntime("VR Genesis Stable")
 
     sw_w, sw_h = rt.image_sizes[0]
     render_w = max(64, int(sw_w * RENDER_SCALE))
@@ -762,7 +853,9 @@ def main():
     print("[Config]")
     print("  WORLD_T =", WORLD_T, "MAPPING =", MAPPING, "FLIP_IMAGE_VERTICAL =", FLIP_IMAGE_VERTICAL)
     print("  RENDER_SCALE =", RENDER_SCALE, "render =", (render_w, render_h), "swapchain =", (sw_w, sw_h))
+    print("  TARGET_RENDER_HZ =", TARGET_RENDER_HZ)
     print("  EYE_SEP_SCALE =", EYE_SEP_SCALE, "SWAP_EYES =", SWAP_EYES)
+    print("  POSE_SMOOTH_POS =", POSE_SMOOTH_POS, "POSE_SMOOTH_ROT =", POSE_SMOOTH_ROT)
 
     meta, shms_main = shm_create_triple(render_w, render_h)
     L = [shm_view_rgb(shms_main[i], render_w, render_h) for i in range(3)]
@@ -812,12 +905,13 @@ def main():
     right_local = np.empty((render_h, render_w, 3), dtype=np.uint8)
 
     def get_tb_frames(expected_seq: int):
-        for _ in range(3):
+        # wait briefly for worker to catch up (tiny), but don't stall long
+        for _ in range(2):
             with published_seq.get_lock():
                 ps = int(published_seq.value)
             if ps >= expected_seq:
                 break
-            time.sleep(0.001)
+            time.sleep(0.0005)
 
         with published_idx.get_lock():
             idx = int(published_idx.value)
