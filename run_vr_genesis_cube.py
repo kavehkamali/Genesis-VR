@@ -1,11 +1,25 @@
+# run_vr_genesis_debug_colors_fixed.py
+#
+# Fixes GenesisException('RigidEntity is not built yet.') by ensuring we do NOT call
+# set_pos() on entities until AFTER scene.build().
+#
+# Controls:
+#   - Hold Grip (side/squeeze) -> move ACTIVE cube with right-hand pose
+#   - Button A -> RED
+#   - Button B -> BLUE
+#   - Trigger > 0.2 -> GREEN
+#   - Thumbstick moved beyond deadzone -> YELLOW
+#   - Else -> GRAY
+#
+# Debug: prints changes for grip/trigger/A/B/thumbstick and pose valid.
+
 import ctypes
-import math
 import os
 import platform
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import List
 
 import numpy as np
 import multiprocessing as mp
@@ -25,30 +39,23 @@ from OpenGL import WGL
 
 
 # ==========================================================
-# USER TUNABLES
+# USER TUNABLES (keep your working setup)
 # ==========================================================
-WORLD_T = (0.0, -1.2, 0.0)          # your working placement
-MAPPING = "A"                       # your working mapping
+WORLD_T = (0.0, -1.2, 0.0)
+MAPPING = "A"
 FLIP_IMAGE_VERTICAL = True
 
-RENDER_SCALE = 1.0                  # 0.6–1.0 (lower = faster, less lag)
-TARGET_RENDER_HZ = 72               # worker render pacing (72/80/90)
-
-EYE_SEP_SCALE = 7.0                 # stereo comfort: try 0.9..1.1, NOT 7.0
+RENDER_SCALE = 1.0
+EYE_SEP_SCALE = 7.0
 SWAP_EYES = False
 
-# smoothing (bigger = smoother but more lag)
-POSE_SMOOTH_POS = 0.65              # 0..1  (0=no smoothing, 0.6..0.8 good)
-POSE_SMOOTH_ROT = 0.65              # 0..1
-
-# reduce Genesis logs
-SILENCE_GENESIS_LOGS = True
+STICK_DEADZONE = 0.30
+DEBUG_INPUTS = True
 
 
 # ==========================================================
 # Shared memory: TRIPLE buffer per eye
 # ==========================================================
-
 @dataclass
 class ShmStereoTB:
     L: List[str]
@@ -58,18 +65,19 @@ class ShmStereoTB:
     channels: int = 3
 
 
-def shm_create_triple(w: int, h: int) -> Tuple[ShmStereoTB, List[SharedMemory]]:
+def shm_create_triple(w: int, h: int):
     nbytes = w * h * 3
     shms = [SharedMemory(create=True, size=nbytes) for _ in range(6)]
     meta = ShmStereoTB(
         L=[shms[0].name, shms[1].name, shms[2].name],
         R=[shms[3].name, shms[4].name, shms[5].name],
-        w=w, h=h
+        w=w,
+        h=h,
     )
     return meta, shms
 
 
-def shm_attach_triple(meta: ShmStereoTB) -> List[SharedMemory]:
+def shm_attach_triple(meta: ShmStereoTB):
     return [SharedMemory(name=n) for n in (meta.L + meta.R)]
 
 
@@ -80,48 +88,13 @@ def shm_view_rgb(shm: SharedMemory, w: int, h: int) -> np.ndarray:
 # ==========================================================
 # Math helpers
 # ==========================================================
-
-def normalize(v: np.ndarray) -> np.ndarray:
-    n = float(np.linalg.norm(v)) + 1e-9
-    return v / n
-
-
-def quat_normalize(q):
-    q = np.asarray(q, dtype=np.float32)
-    return q / (np.linalg.norm(q) + 1e-9)
-
-
-def quat_dot(a, b):
-    return float(np.dot(a, b))
-
-
-def quat_slerp(q0, q1, t: float):
-    q0 = quat_normalize(q0)
-    q1 = quat_normalize(q1)
-
-    # shortest path
-    if quat_dot(q0, q1) < 0.0:
-        q1 = -q1
-
-    dot = np.clip(quat_dot(q0, q1), -1.0, 1.0)
-
-    if dot > 0.9995:
-        return quat_normalize(q0 + t * (q1 - q0))
-
-    theta_0 = math.acos(dot)
-    theta = theta_0 * t
-    s0 = math.sin(theta_0 - theta) / math.sin(theta_0)
-    s1 = math.sin(theta) / math.sin(theta_0)
-    return quat_normalize((s0 * q0) + (s1 * q1))
-
-
 def quat_to_rotmat_xyzw(qx, qy, qz, qw) -> np.ndarray:
     x, y, z, w = qx, qy, qz, qw
     return np.array(
         [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
-            [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ],
         dtype=np.float32,
     )
@@ -135,6 +108,11 @@ def xr_basis_from_quat(q_xyzw):
     up = R[:, 1]
     forward = -R[:, 2]
     return right.astype(np.float32), up.astype(np.float32), forward.astype(np.float32)
+
+
+def normalize(v):
+    n = float(np.linalg.norm(v)) + 1e-9
+    return v / n
 
 
 def map_vec_xr_to_gen(v):
@@ -154,14 +132,16 @@ def map_pos_xr_to_gen(p_xyz, world_t=WORLD_T):
 # ==========================================================
 # Genesis worker process
 # ==========================================================
-
 def _force_utf8_stdio():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    except Exception:
+        pass
 
 
 def _to_uint8_rgb(img):
@@ -206,6 +186,15 @@ def _cam_set_pose(cam, pos, lookat, up):
     cam.set_pose(pos=pos, lookat=lookat)
 
 
+def _make_surface(gs, rgb):
+    try:
+        s = gs.surfaces.Default()
+        s.color = tuple(float(x) for x in rgb)
+        return s
+    except Exception:
+        return None
+
+
 def genesis_worker(meta: ShmStereoTB,
                    ctrl_queue: mp.Queue,
                    status_queue: mp.Queue,
@@ -216,28 +205,19 @@ def genesis_worker(meta: ShmStereoTB,
     try:
         _force_utf8_stdio()
 
-        if SILENCE_GENESIS_LOGS:
-            import logging
-            logging.getLogger().handlers.clear()
-            logging.getLogger().setLevel(logging.ERROR)
-            for name in ["genesis", "gstaichi", "taichi"]:
-                logging.getLogger(name).setLevel(logging.ERROR)
+        os.environ.setdefault("GENESIS_LOG_LEVEL", "WARNING")
 
         import genesis as gs
-
-        # IMPORTANT: Genesis supports logging_level in gs.init() :contentReference[oaicite:2]{index=2}
-        if SILENCE_GENESIS_LOGS:
-            gs.init(backend=gs.cpu, logging_level="error")
-        else:
+        try:
+            gs.init(backend=gs.cpu, logging_level="warning", theme="dumb")
+        except TypeError:
             gs.init(backend=gs.cpu)
 
         shms = shm_attach_triple(meta)
         L = [shm_view_rgb(shms[i], meta.w, meta.h) for i in range(3)]
-        R = [shm_view_rgb(shms[i+3], meta.w, meta.h) for i in range(3)]
+        R = [shm_view_rgb(shms[i + 3], meta.w, meta.h) for i in range(3)]
 
         scene = gs.Scene(show_viewer=False, renderer=gs.renderers.Rasterizer())
-
-        # Ring plate + cube
         scene.add_entity(gs.morphs.Plane())
 
         ring_z = 0.10
@@ -247,134 +227,151 @@ def genesis_worker(meta: ShmStereoTB,
         rail_w = (ring_outer - hole) / 2.0
 
         scene.add_entity(gs.morphs.Box(size=(ring_outer, rail_w, plate_t),
-                                       pos=(0.0, -(hole/2.0 + rail_w/2.0), ring_z),
+                                       pos=(0.0, -(hole / 2.0 + rail_w / 2.0), ring_z),
                                        fixed=True))
         scene.add_entity(gs.morphs.Box(size=(ring_outer, rail_w, plate_t),
-                                       pos=(0.0, +(hole/2.0 + rail_w/2.0), ring_z),
+                                       pos=(0.0, +(hole / 2.0 + rail_w / 2.0), ring_z),
                                        fixed=True))
         scene.add_entity(gs.morphs.Box(size=(rail_w, hole, plate_t),
-                                       pos=(-(hole/2.0 + rail_w/2.0), 0.0, ring_z),
+                                       pos=(-(hole / 2.0 + rail_w / 2.0), 0.0, ring_z),
                                        fixed=True))
         scene.add_entity(gs.morphs.Box(size=(rail_w, hole, plate_t),
-                                       pos=(+(hole/2.0 + rail_w/2.0), 0.0, ring_z),
+                                       pos=(+(hole / 2.0 + rail_w / 2.0), 0.0, ring_z),
                                        fixed=True))
 
-        cube = scene.add_entity(gs.morphs.Box(size=(0.08, 0.08, 0.08),
-                                              pos=(0.30, 0.0, ring_z + 0.25),
-                                              fixed=False))
+        # Create all cubes at START_POS (no set_pos yet!)
+        cube_size = (0.08, 0.08, 0.08)
+        start_pos = (0.30, 0.0, ring_z + 0.25)
+        hide_pos = (0.0, 0.0, -10.0)
 
-        camL = scene.add_camera(res=(meta.w, meta.h), pos=(1.2, -0.03, 1.0),
-                                lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False)
-        camR = scene.add_camera(res=(meta.w, meta.h), pos=(1.2, +0.03, 1.0),
-                                lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False)
+        COLORS = {
+            "gray": (0.6, 0.6, 0.6),
+            "red": (1.0, 0.1, 0.1),
+            "blue": (0.1, 0.3, 1.0),
+            "green": (0.2, 1.0, 0.2),
+            "yellow": (1.0, 1.0, 0.2),
+        }
+        color_names = ["gray", "red", "blue", "green", "yellow"]
 
+        cubes = []
+        for name in color_names:
+            surf = _make_surface(gs, COLORS[name])
+            if surf is not None:
+                ent = scene.add_entity(gs.morphs.Box(size=cube_size, pos=start_pos, fixed=False), surface=surf)
+            else:
+                ent = scene.add_entity(gs.morphs.Box(size=cube_size, pos=start_pos, fixed=False))
+            cubes.append(ent)
+
+        cam = [
+            scene.add_camera(res=(meta.w, meta.h), pos=(1.2, -0.03, 1.0), lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False),
+            scene.add_camera(res=(meta.w, meta.h), pos=(1.2, +0.03, 1.0), lookat=(0, 0, ring_z), fov=vfov_deg, GUI=False),
+        ]
+
+        # BUILD FIRST
         scene.build()
+
+        # Now it is safe to move/hide/switch
+        active_idx = 0  # gray
+        for i in range(len(cubes)):
+            if i == active_idx:
+                cubes[i].set_pos(start_pos, zero_velocity=True)
+            else:
+                cubes[i].set_pos(hide_pos, zero_velocity=True)
+
         status_queue.put({"ok": True, "msg": "Genesis worker ready"})
 
-        # latest inputs
-        grip = False
-        trigger = 0.0
-        hand_pos = None
-
-        head_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        head_q = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-        ipd = 0.064  # default fallback meters
-
-        have_pose = False
         want_seq = -1
-
-        # smoothed state
-        head_pos_s = head_pos.copy()
-        head_q_s = head_q.copy()
-
         next_write = 0
-        dt_target = 1.0 / max(10.0, float(TARGET_RENDER_HZ))
-        t_next = time.perf_counter()
+        last_cube_pos = start_pos
 
         while not stop_event.is_set():
-            # non-blocking drain: ALWAYS render at steady rate (prevents "jump every 0.05s")
-            got_any = False
             try:
-                while True:
-                    msg = ctrl_queue.get_nowait()
-                    if msg is None:
-                        continue
-                    got_any = True
-                    seq = int(msg.get("seq", -1))
-                    if seq == want_seq:
-                        continue
-                    want_seq = seq
-
-                    grip = bool(msg.get("grip", grip))
-                    trigger = float(msg.get("trigger", trigger))
-
-                    hp = msg.get("hand_pos", None)
-                    hand_pos = tuple(hp) if hp is not None else None
-
-                    hp2 = msg.get("head_pos", None)
-                    hq2 = msg.get("head_q", None)
-                    ipd2 = msg.get("ipd", None)
-
-                    if hp2 is not None and hq2 is not None:
-                        head_pos = np.array(hp2, dtype=np.float32)
-                        head_q = np.array(hq2, dtype=np.float32)
-                        have_pose = True
-                    if ipd2 is not None:
-                        ipd = float(ipd2)
+                msg = ctrl_queue.get(timeout=0.05)
             except Exception:
-                pass
+                continue
+            if msg is None:
+                continue
 
-            # cube control
+            seq = int(msg.get("seq", -1))
+            if seq == want_seq:
+                continue
+            want_seq = seq
+
+            grip = bool(msg.get("grip", False))
+            trigger = float(msg.get("trigger", 0.0))
+            button_a = bool(msg.get("button_a", False))
+            button_b = bool(msg.get("button_b", False))
+            stick_list = msg.get("stick", [0.0, 0.0])
+            sx, sy = float(stick_list[0]), float(stick_list[1])
+
+            hp = msg.get("hand_pos", None)
+            hand_pos = tuple(hp) if hp is not None else None
+            eye_pose = msg.get("eye_pose", [None, None])
+
+            stick_active = (abs(sx) > STICK_DEADZONE) or (abs(sy) > STICK_DEADZONE)
+
+            desired_name = "gray"
+            if button_a:
+                desired_name = "red"
+            elif button_b:
+                desired_name = "blue"
+            elif stick_active:
+                desired_name = "yellow"
+            elif trigger > 0.2:
+                desired_name = "green"
+            desired_idx = color_names.index(desired_name)
+
+            if desired_idx != active_idx:
+                cubes[active_idx].set_pos(hide_pos, zero_velocity=True)
+                active_idx = desired_idx
+                cubes[active_idx].set_pos(last_cube_pos, zero_velocity=True)
+
             if grip and hand_pos is not None:
                 hx, hy, hz = hand_pos
                 gx, gy, gz = map_pos_xr_to_gen((hx, hy, hz), world_t=WORLD_T)
                 x = float(np.clip(gx, -0.45, 0.45))
                 y = float(np.clip(gy, -0.45, 0.45))
                 z = float(ring_z + 0.12 + 0.25 * trigger)
-                cube.set_pos((x, y, z), zero_velocity=True)
+                last_cube_pos = (x, y, z)
+                cubes[active_idx].set_pos(last_cube_pos, zero_velocity=True)
 
             scene.step()
 
-            # head pose smoothing (reduces jitter at cost of a bit of latency)
-            if have_pose:
-                # position EMA
-                head_pos_s = (POSE_SMOOTH_POS * head_pos_s) + ((1.0 - POSE_SMOOTH_POS) * head_pos)
+            # Eye separation scaling
+            head = None
+            if eye_pose[0] is not None and eye_pose[1] is not None:
+                p0 = np.array(eye_pose[0]["p"], dtype=np.float32)
+                p1 = np.array(eye_pose[1]["p"], dtype=np.float32)
+                head = 0.5 * (p0 + p1)
 
-                # rotation slerp smoothing toward newest
-                head_q_s = quat_slerp(head_q_s, head_q, 1.0 - POSE_SMOOTH_ROT)
+            for i in (0, 1):
+                if eye_pose[i] is None:
+                    continue
+                px, py, pz = eye_pose[i]["p"]
+                qx, qy, qz, qw = eye_pose[i]["q"]
 
-                # build Genesis L/R cameras from ONE shared orientation + IPD baseline
-                right, up, forward = xr_basis_from_quat(head_q_s)
+                if head is not None:
+                    pi = np.array([px, py, pz], dtype=np.float32)
+                    pi = head + EYE_SEP_SCALE * (pi - head)
+                    px, py, pz = float(pi[0]), float(pi[1]), float(pi[2])
+
+                _, up, forward = xr_basis_from_quat((qx, qy, qz, qw))
                 g_forward = normalize(map_vec_xr_to_gen(forward))
                 g_up = normalize(map_vec_xr_to_gen(up))
-                g_right = normalize(map_vec_xr_to_gen(right))
 
-                # map head position to Genesis space
-                g_head = np.array(map_pos_xr_to_gen(head_pos_s, world_t=WORLD_T), dtype=np.float32)
+                gpos = map_pos_xr_to_gen((px, py, pz), world_t=WORLD_T)
+                lookat = (gpos[0] + float(g_forward[0]),
+                          gpos[1] + float(g_forward[1]),
+                          gpos[2] + float(g_forward[2]))
+                gup = (float(g_up[0]), float(g_up[1]), float(g_up[2]))
 
-                half_sep = 0.5 * ipd * float(EYE_SEP_SCALE)
-                g_L = g_head - g_right * half_sep
-                g_R = g_head + g_right * half_sep
+                _cam_set_pose(cam[i], pos=gpos, lookat=lookat, up=gup)
 
-                lookL = g_L + g_forward
-                lookR = g_R + g_forward
-
-                _cam_set_pose(camL,
-                             pos=(float(g_L[0]), float(g_L[1]), float(g_L[2])),
-                             lookat=(float(lookL[0]), float(lookL[1]), float(lookL[2])),
-                             up=(float(g_up[0]), float(g_up[1]), float(g_up[2])))
-
-                _cam_set_pose(camR,
-                             pos=(float(g_R[0]), float(g_R[1]), float(g_R[2])),
-                             lookat=(float(lookR[0]), float(lookR[1]), float(lookR[2])),
-                             up=(float(g_up[0]), float(g_up[1]), float(g_up[2])))
-
-            # render
             write_idx = next_write % 3
             next_write += 1
 
-            rgb0 = _render_rgb(camL)
-            rgb1 = _render_rgb(camR)
+            rgb0 = _render_rgb(cam[0])
+            rgb1 = _render_rgb(cam[1])
 
             if FLIP_IMAGE_VERTICAL:
                 if rgb0 is not None:
@@ -391,16 +388,6 @@ def genesis_worker(meta: ShmStereoTB,
                 published_idx.value = write_idx
             with published_seq.get_lock():
                 published_seq.value = want_seq
-
-            # steady pacing
-            t_now = time.perf_counter()
-            t_next += dt_target
-            sleep_s = t_next - t_now
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-            else:
-                # we're late; reset to avoid runaway drift
-                t_next = t_now
 
         try:
             scene.destroy()
@@ -419,7 +406,6 @@ def genesis_worker(meta: ShmStereoTB,
 # ==========================================================
 # OpenGL blit
 # ==========================================================
-
 def compile_shader(src: str, shader_type):
     sid = GL.glCreateShader(shader_type)
     GL.glShaderSource(sid, src)
@@ -505,9 +491,8 @@ class FullscreenBlitter:
 # ==========================================================
 # OpenXR runtime (main process)
 # ==========================================================
-
 class XrRuntime:
-    def __init__(self, title="VR Genesis Stable"):
+    def __init__(self, title="VR Genesis Debug Colors FIXED"):
         if platform.system() != "Windows":
             raise RuntimeError("Windows-only (WGL + SDL).")
 
@@ -521,16 +506,12 @@ class XrRuntime:
         if req not in avail:
             raise RuntimeError("XR_KHR_opengl_enable not available")
 
-        app_info = xr.ApplicationInfo("vr_genesis_stable", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
-        self.instance = xr.create_instance(
-            xr.InstanceCreateInfo(application_info=app_info, enabled_extension_names=[req])
-        )
+        app_info = xr.ApplicationInfo("vr_genesis_debug_colors_fixed", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
+        self.instance = xr.create_instance(xr.InstanceCreateInfo(application_info=app_info, enabled_extension_names=[req]))
 
         self.system_id = xr.get_system(self.instance, xr.SystemGetInfo(xr.FormFactor.HEAD_MOUNTED_DISPLAY))
         self.view_config_type = xr.ViewConfigurationType.PRIMARY_STEREO
-        self.view_config_views = xr.enumerate_view_configuration_views(
-            self.instance, self.system_id, self.view_config_type
-        )
+        self.view_config_views = xr.enumerate_view_configuration_views(self.instance, self.system_id, self.view_config_type)
 
         if sdl2.SDL_Init(sdl2.SDL_INIT_VIDEO) != 0:
             raise RuntimeError("SDL_Init failed")
@@ -579,7 +560,7 @@ class XrRuntime:
 
         identity = xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1), position=xr.Vector3f(0, 0, 0))
 
-        # Prefer STAGE for stable "world locked" if available
+        # Prefer STAGE if available
         try:
             self.reference_space = xr.create_reference_space(
                 self.session,
@@ -593,6 +574,7 @@ class XrRuntime:
                                             pose_in_reference_space=identity),
             )
 
+        # Swapchains
         self.swapchains = []
         self.swapchain_images = []
         self.image_sizes = []
@@ -624,7 +606,7 @@ class XrRuntime:
 
         self.fbo = GL.glGenFramebuffers(1)
 
-        # actions
+        # Actions
         self.action_set = xr.create_action_set(
             self.instance,
             xr.ActionSetCreateInfo(action_set_name="teleop", localized_action_set_name="Teleop", priority=0),
@@ -646,6 +628,26 @@ class XrRuntime:
             xr.ActionCreateInfo(action_name="right_hand_pose", action_type=xr.ActionType.POSE_INPUT,
                                 localized_action_name="Right Hand Pose", subaction_paths=[self.right_hand_path]),
         )
+        self.button_a_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(action_name="button_a", action_type=xr.ActionType.BOOLEAN_INPUT,
+                                localized_action_name="Button A", subaction_paths=[self.right_hand_path]),
+        )
+        self.button_b_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(action_name="button_b", action_type=xr.ActionType.BOOLEAN_INPUT,
+                                localized_action_name="Button B", subaction_paths=[self.right_hand_path]),
+        )
+        self.thumbstick_x_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(action_name="thumbstick_x", action_type=xr.ActionType.FLOAT_INPUT,
+                                localized_action_name="Thumbstick X", subaction_paths=[self.right_hand_path]),
+        )
+        self.thumbstick_y_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(action_name="thumbstick_y", action_type=xr.ActionType.FLOAT_INPUT,
+                                localized_action_name="Thumbstick Y", subaction_paths=[self.right_hand_path]),
+        )
 
         profile = xr.string_to_path(self.instance, "/interaction_profiles/oculus/touch_controller")
         xr.suggest_interaction_profile_bindings(
@@ -656,6 +658,10 @@ class XrRuntime:
                     xr.ActionSuggestedBinding(self.grip_action, xr.string_to_path(self.instance, "/user/hand/right/input/squeeze/value")),
                     xr.ActionSuggestedBinding(self.trigger_action, xr.string_to_path(self.instance, "/user/hand/right/input/trigger/value")),
                     xr.ActionSuggestedBinding(self.hand_pose_action, xr.string_to_path(self.instance, "/user/hand/right/input/grip/pose")),
+                    xr.ActionSuggestedBinding(self.button_a_action, xr.string_to_path(self.instance, "/user/hand/right/input/a/click")),
+                    xr.ActionSuggestedBinding(self.button_b_action, xr.string_to_path(self.instance, "/user/hand/right/input/b/click")),
+                    xr.ActionSuggestedBinding(self.thumbstick_x_action, xr.string_to_path(self.instance, "/user/hand/right/input/thumbstick/x")),
+                    xr.ActionSuggestedBinding(self.thumbstick_y_action, xr.string_to_path(self.instance, "/user/hand/right/input/thumbstick/y")),
                 ],
             ),
         )
@@ -670,6 +676,8 @@ class XrRuntime:
         xr.begin_session(self.session, xr.SessionBeginInfo(primary_view_configuration_type=self.view_config_type))
         self.active_action_set = xr.ActiveActionSet(action_set=self.action_set, subaction_path=xr.NULL_PATH)
         self.environment_blend_mode = xr.EnvironmentBlendMode.OPAQUE
+
+        self._dbg_last = {"grip": None, "a": None, "b": None, "trig": None, "sx": None, "sy": None, "pose_valid": None}
 
     def shutdown(self):
         try: xr.end_session(self.session)
@@ -686,6 +694,40 @@ class XrRuntime:
         except Exception: pass
         try: sdl2.SDL_Quit()
         except Exception: pass
+
+    def _dbg_print_changes(self, grip, trigger, a, b, sx, sy, pose_valid):
+        if not DEBUG_INPUTS:
+            return
+        last = self._dbg_last
+
+        def pr(name, val):
+            print(f"[DBG] {name}: {val}")
+
+        if last["grip"] is None or grip != last["grip"]:
+            pr("Grip", int(grip))
+        if last["a"] is None or a != last["a"]:
+            pr("Button A", int(a))
+        if last["b"] is None or b != last["b"]:
+            pr("Button B", int(b))
+
+        if last["trig"] is None or abs(trigger - last["trig"]) > 0.05:
+            pr("Trigger", f"{trigger:.2f}")
+
+        if last["sx"] is None or abs(sx - last["sx"]) > 0.20 or (abs(sx) < 0.05 and abs(last["sx"]) >= 0.05):
+            pr("Thumbstick X", f"{sx:.2f}")
+        if last["sy"] is None or abs(sy - last["sy"]) > 0.20 or (abs(sy) < 0.05 and abs(last["sy"]) >= 0.05):
+            pr("Thumbstick Y", f"{sy:.2f}")
+
+        if last["pose_valid"] is None or pose_valid != last["pose_valid"]:
+            pr("Hand pose valid", int(pose_valid))
+
+        last["grip"] = grip
+        last["a"] = a
+        last["b"] = b
+        last["trig"] = trigger
+        last["sx"] = sx
+        last["sy"] = sy
+        last["pose_valid"] = pose_valid
 
     def run(self, get_tb_frames, send_to_worker, blit_left: FullscreenBlitter, blit_right: FullscreenBlitter):
         running = True
@@ -717,32 +759,47 @@ class XrRuntime:
             except Exception:
                 pass
 
-            # --- controller ---
             grip = False
             trigger = 0.0
+            button_a = False
+            button_b = False
+            sx, sy = 0.0, 0.0
             hand_pos = None
+            pose_valid = False
 
             try:
                 g = xr.get_action_state_boolean(self.session, xr.ActionStateGetInfo(action=self.grip_action, subaction_path=xr.NULL_PATH))
                 t = xr.get_action_state_float(self.session, xr.ActionStateGetInfo(action=self.trigger_action, subaction_path=xr.NULL_PATH))
+                a = xr.get_action_state_boolean(self.session, xr.ActionStateGetInfo(action=self.button_a_action, subaction_path=xr.NULL_PATH))
+                b = xr.get_action_state_boolean(self.session, xr.ActionStateGetInfo(action=self.button_b_action, subaction_path=xr.NULL_PATH))
+                ax = xr.get_action_state_float(self.session, xr.ActionStateGetInfo(action=self.thumbstick_x_action, subaction_path=xr.NULL_PATH))
+                ay = xr.get_action_state_float(self.session, xr.ActionStateGetInfo(action=self.thumbstick_y_action, subaction_path=xr.NULL_PATH))
+
                 grip = bool(g.current_state)
                 trigger = float(t.current_state)
+                button_a = bool(a.current_state)
+                button_b = bool(b.current_state)
+                sx, sy = float(ax.current_state), float(ay.current_state)
 
                 loc = xr.locate_space(self.hand_space, self.reference_space, frame_state.predicted_display_time)
                 flags = loc.location_flags
-                if (flags & xr.SpaceLocationFlags.POSITION_VALID_BIT) and (flags & xr.SpaceLocationFlags.ORIENTATION_VALID_BIT):
+                pose_valid = bool((flags & xr.SpaceLocationFlags.POSITION_VALID_BIT) and (flags & xr.SpaceLocationFlags.ORIENTATION_VALID_BIT))
+                if pose_valid:
                     p = loc.pose.position
                     hand_pos = (float(p.x), float(p.y), float(p.z))
             except Exception:
                 pass
 
-            # --- views ---
+            self._dbg_print_changes(grip, trigger, button_a, button_b, sx, sy, pose_valid)
+
             try:
                 _, located_views = xr.locate_views(
                     self.session,
-                    xr.ViewLocateInfo(view_configuration_type=self.view_config_type,
-                                      display_time=frame_state.predicted_display_time,
-                                      space=self.reference_space),
+                    xr.ViewLocateInfo(
+                        view_configuration_type=self.view_config_type,
+                        display_time=frame_state.predicted_display_time,
+                        space=self.reference_space
+                    ),
                 )
             except Exception:
                 xr.end_frame(self.session, xr.FrameEndInfo(display_time=frame_state.predicted_display_time,
@@ -750,31 +807,23 @@ class XrRuntime:
                                                            layers=[]))
                 continue
 
-            # compute head pose + ipd from eyes
-            p0 = located_views[0].pose.position
-            p1 = located_views[1].pose.position
-            q0 = located_views[0].pose.orientation
-            q1 = located_views[1].pose.orientation
-
-            eye0 = np.array([float(p0.x), float(p0.y), float(p0.z)], dtype=np.float32)
-            eye1 = np.array([float(p1.x), float(p1.y), float(p1.z)], dtype=np.float32)
-            head_pos = 0.5 * (eye0 + eye1)
-            ipd = float(np.linalg.norm(eye1 - eye0))
-
-            qq0 = np.array([float(q0.x), float(q0.y), float(q0.z), float(q0.w)], dtype=np.float32)
-            qq1 = np.array([float(q1.x), float(q1.y), float(q1.z), float(q1.w)], dtype=np.float32)
-            # average orientation (slerp 50/50)
-            head_q = quat_slerp(qq0, qq1, 0.5)
+            eye_pose = []
+            for i in (0, 1):
+                p = located_views[i].pose.position
+                q = located_views[i].pose.orientation
+                eye_pose.append({"p": (float(p.x), float(p.y), float(p.z)),
+                                 "q": (float(q.x), float(q.y), float(q.z), float(q.w))})
 
             seq += 1
             send_to_worker(
                 seq=seq,
                 grip=grip,
                 trigger=trigger,
+                button_a=button_a,
+                button_b=button_b,
+                stick=[sx, sy],
                 hand_pos=list(hand_pos) if hand_pos is not None else None,
-                head_pos=[float(head_pos[0]), float(head_pos[1]), float(head_pos[2])],
-                head_q=[float(head_q[0]), float(head_q[1]), float(head_q[2]), float(head_q[3])],
-                ipd=ipd,
+                eye_pose=eye_pose,
             )
 
             rgb_left, rgb_right = get_tb_frames(seq)
@@ -833,18 +882,10 @@ class XrRuntime:
 # ==========================================================
 # Main
 # ==========================================================
-
 def main():
     mp.set_start_method("spawn", force=True)
 
-    # (optional) reduce unicode issues in main too
-    try:
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-
-    rt = XrRuntime("VR Genesis Stable")
+    rt = XrRuntime("VR Genesis Debug Colors FIXED")
 
     sw_w, sw_h = rt.image_sizes[0]
     render_w = max(64, int(sw_w * RENDER_SCALE))
@@ -853,13 +894,12 @@ def main():
     print("[Config]")
     print("  WORLD_T =", WORLD_T, "MAPPING =", MAPPING, "FLIP_IMAGE_VERTICAL =", FLIP_IMAGE_VERTICAL)
     print("  RENDER_SCALE =", RENDER_SCALE, "render =", (render_w, render_h), "swapchain =", (sw_w, sw_h))
-    print("  TARGET_RENDER_HZ =", TARGET_RENDER_HZ)
     print("  EYE_SEP_SCALE =", EYE_SEP_SCALE, "SWAP_EYES =", SWAP_EYES)
-    print("  POSE_SMOOTH_POS =", POSE_SMOOTH_POS, "POSE_SMOOTH_ROT =", POSE_SMOOTH_ROT)
+    print("  DEBUG_INPUTS =", DEBUG_INPUTS)
 
     meta, shms_main = shm_create_triple(render_w, render_h)
     L = [shm_view_rgb(shms_main[i], render_w, render_h) for i in range(3)]
-    R = [shm_view_rgb(shms_main[i+3], render_w, render_h) for i in range(3)]
+    R = [shm_view_rgb(shms_main[i + 3], render_w, render_h) for i in range(3)]
 
     ctrl_queue = mp.Queue(maxsize=1)
     status_queue = mp.Queue(maxsize=10)
@@ -900,18 +940,16 @@ def main():
         except Exception:
             pass
 
-    # local copy buffers to avoid tearing
     left_local = np.empty((render_h, render_w, 3), dtype=np.uint8)
     right_local = np.empty((render_h, render_w, 3), dtype=np.uint8)
 
     def get_tb_frames(expected_seq: int):
-        # wait briefly for worker to catch up (tiny), but don't stall long
-        for _ in range(2):
+        for _ in range(5):
             with published_seq.get_lock():
                 ps = int(published_seq.value)
             if ps >= expected_seq:
                 break
-            time.sleep(0.0005)
+            time.sleep(0.001)
 
         with published_idx.get_lock():
             idx = int(published_idx.value)
