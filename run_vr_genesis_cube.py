@@ -1,9 +1,12 @@
-# run_vr_opengl_game_style.py
+# run_vr_opengl_game_style_shadows.py
 #
-# Quest Link / OpenXR "game-style" pipeline:
-# - Render directly into OpenXR swapchain GL textures (GPU->GPU)
-# - Use OpenXR per-eye pose + FOV to build view/projection
-# - No Genesis cam.render(), no CPU readback, no glTexSubImage2D, no shared memory
+# Fixes:
+# 1) Adds color + texture + lighting + shadows (shadow map)
+# 2) Correct camera pose: view = inverse(OpenXR eye pose)
+# 3) Fixed objects stay fixed in reference space
+# 4) Correct stereo: DO NOT scale eye separation (no IPD scaling)
+#
+# Still uses the fast pipeline: render directly into OpenXR swapchain textures (GPU->GPU).
 #
 # Controls:
 #   - Hold Grip -> move ACTIVE cube with right-hand pose
@@ -12,17 +15,13 @@
 #   - Trigger > 0.2 -> GREEN
 #   - Thumbstick beyond deadzone -> YELLOW
 #   - Else -> GRAY
-#
-# This is what VR games do. It will feel dramatically more stable on head motion.
 
 import ctypes
 import os
 import platform
-import sys
-import time
 import math
-
 import numpy as np
+
 import xr  # pyopenxr
 
 # SDL2 / OpenGL
@@ -37,18 +36,22 @@ from OpenGL import WGL
 
 
 # ==========================================================
-# USER TUNABLES (match your original)
+# USER TUNABLES
 # ==========================================================
-WORLD_T = (0.0, -1.2, 0.0)
-MAPPING = "A"
-
-EYE_SEP_SCALE = 7.0
-SWAP_EYES = False
+# Place the scene a bit down and forward in XR space (XR: +X right, +Y up, -Z forward)
+SCENE_OFFSET = np.array([0.0, -1.2, -1.2], dtype=np.float32)
 
 STICK_DEADZONE = 0.30
 DEBUG_INPUTS = True
 
-# Scene layout (same as your Genesis scene)
+SWAP_EYES = False  # keep False unless you know your runtime is swapped
+
+# Shadows
+SHADOW_MAP_SIZE = 2048
+LIGHT_DIR = np.array([0.35, -1.0, 0.25], dtype=np.float32)  # directional light (world space)
+LIGHT_DIR = LIGHT_DIR / (np.linalg.norm(LIGHT_DIR) + 1e-9)
+
+# Scene layout (similar to your Genesis scene, in "scene local" coords)
 RING_Z = 0.10
 RING_OUTER = 1.0
 HOLE = 0.35
@@ -56,7 +59,7 @@ PLATE_T = 0.05
 RAIL_W = (RING_OUTER - HOLE) / 2.0
 
 CUBE_SIZE = 0.08
-START_POS = np.array([0.30, 0.0, RING_Z + 0.25], dtype=np.float32)
+START_POS_LOCAL = np.array([0.30, 0.0, RING_Z + 0.25], dtype=np.float32)
 
 COLORS = {
     "gray":   (0.6, 0.6, 0.6, 1.0),
@@ -69,7 +72,7 @@ COLOR_NAMES = ["gray", "red", "blue", "green", "yellow"]
 
 
 # ==========================================================
-# Math helpers (same mapping idea as your code)
+# Math helpers
 # ==========================================================
 def normalize(v):
     n = float(np.linalg.norm(v)) + 1e-9
@@ -79,60 +82,31 @@ def quat_to_rotmat_xyzw(qx, qy, qz, qw) -> np.ndarray:
     x, y, z, w = qx, qy, qz, qw
     return np.array(
         [
-            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w)],
+            [2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y)],
         ],
         dtype=np.float32,
     )
-
-def xr_basis_from_quat(q_xyzw):
-    # OpenXR: right=+X, up=+Y, forward=-Z
-    qx, qy, qz, qw = q_xyzw
-    R = quat_to_rotmat_xyzw(qx, qy, qz, qw)
-    right = R[:, 0]
-    up = R[:, 1]
-    forward = -R[:, 2]
-    return right.astype(np.float32), up.astype(np.float32), forward.astype(np.float32)
-
-def map_vec_xr_to_gen(v):
-    x, y, z = float(v[0]), float(v[1]), float(v[2])
-    if MAPPING == "A":
-        return np.array([x, -z, y], dtype=np.float32)
-    if MAPPING == "B":
-        return np.array([x,  z, y], dtype=np.float32)
-    return np.array([x, y, -z], dtype=np.float32)
-
-def map_pos_xr_to_gen(p_xyz, world_t=WORLD_T):
-    p = map_vec_xr_to_gen(p_xyz)
-    return np.array([p[0] + world_t[0], p[1] + world_t[1], p[2] + world_t[2]], dtype=np.float32)
-
 
 def mat4_identity():
     return np.eye(4, dtype=np.float32)
 
 def mat4_translate(t):
     M = mat4_identity()
-    M[0, 3] = t[0]
-    M[1, 3] = t[1]
-    M[2, 3] = t[2]
+    M[0, 3] = float(t[0])
+    M[1, 3] = float(t[1])
+    M[2, 3] = float(t[2])
     return M
 
 def mat4_scale(sx, sy, sz):
     M = mat4_identity()
-    M[0, 0] = sx
-    M[1, 1] = sy
-    M[2, 2] = sz
-    return M
-
-def mat4_from_rotation_translation(R, t):
-    M = mat4_identity()
-    M[:3, :3] = R
-    M[:3, 3] = t
+    M[0, 0] = float(sx)
+    M[1, 1] = float(sy)
+    M[2, 2] = float(sz)
     return M
 
 def mat4_inverse_rt(R, t):
-    # inverse of [R t; 0 1] with R orthonormal
     Rt = R.T
     ti = -Rt @ t
     M = mat4_identity()
@@ -140,17 +114,13 @@ def mat4_inverse_rt(R, t):
     M[:3, 3] = ti
     return M
 
-def openxr_projection_from_fov(fov: xr.Fovf, near=0.05, far=100.0):
-    # Standard OpenXR projection matrix (right-handed, -Z forward in view space)
-    # fov angles are in radians: left, right, up, down
+def openxr_projection_from_fov(fov: xr.Fovf, near=0.05, far=50.0):
+    # OpenGL clip z in [-1, 1]
     l = math.tan(fov.angle_left)
     r = math.tan(fov.angle_right)
     u = math.tan(fov.angle_up)
     d = math.tan(fov.angle_down)
 
-    # OpenXR style (similar to Vulkan/GL with clip space)
-    # We'll build an OpenGL-compatible matrix (NDC z in [-1,1])
-    # Using common formula for asymmetric frustum.
     M = np.zeros((4, 4), dtype=np.float32)
     M[0, 0] = 2.0 / (r - l)
     M[1, 1] = 2.0 / (u - d)
@@ -161,9 +131,23 @@ def openxr_projection_from_fov(fov: xr.Fovf, near=0.05, far=100.0):
     M[3, 2] = -1.0
     return M
 
+def look_at(eye, target, up):
+    f = normalize(target - eye)
+    s = normalize(np.cross(f, up))
+    u = np.cross(s, f)
+
+    M = mat4_identity()
+    M[0, 0:3] = s
+    M[1, 0:3] = u
+    M[2, 0:3] = -f
+    M[0, 3] = -np.dot(s, eye)
+    M[1, 3] = -np.dot(u, eye)
+    M[2, 3] = np.dot(f, eye)
+    return M
+
 
 # ==========================================================
-# Minimal OpenGL renderer (simple lit-ish color)
+# OpenGL shader helpers
 # ==========================================================
 def compile_shader(src: str, shader_type):
     sid = GL.glCreateShader(shader_type)
@@ -184,115 +168,349 @@ def link_program(vs, fs):
         raise RuntimeError(GL.glGetProgramInfoLog(pid).decode("utf-8", "ignore"))
     return pid
 
-class SimpleRenderer:
+
+# ==========================================================
+# Renderer with texture + lighting + shadow map
+# ==========================================================
+class LitShadowRenderer:
     def __init__(self):
+        self._init_programs()
+        self._init_meshes()
+        self._init_checker_texture()
+        self._init_shadow_map()
+
+    def _init_programs(self):
+        # Main shader: textured + colored + lambert + shadow
         vs_src = r"""
         #version 330 core
         layout(location=0) in vec3 aPos;
+        layout(location=1) in vec3 aNrm;
+        layout(location=2) in vec2 aUV;
 
-        uniform mat4 uMVP;
+        uniform mat4 uM;
+        uniform mat4 uVP;
+        uniform mat4 uLightVP;
+
+        out vec3 vWorldPos;
+        out vec3 vNrm;
+        out vec2 vUV;
+        out vec4 vShadowCoord;
 
         void main() {
-            gl_Position = uMVP * vec4(aPos, 1.0);
+            vec4 wp = uM * vec4(aPos, 1.0);
+            vWorldPos = wp.xyz;
+            vNrm = mat3(uM) * aNrm;
+            vUV = aUV;
+            vShadowCoord = uLightVP * wp;
+            gl_Position = uVP * wp;
         }
         """
+
         fs_src = r"""
         #version 330 core
+        in vec3 vWorldPos;
+        in vec3 vNrm;
+        in vec2 vUV;
+        in vec4 vShadowCoord;
+
         uniform vec4 uColor;
+        uniform vec3 uLightDir;     // normalized, world space
+        uniform sampler2D uTex;
+        uniform sampler2DShadow uShadowMap;
+
         out vec4 oColor;
+
+        float shadow_factor(vec4 sc) {
+            // Perspective divide to NDC
+            vec3 proj = sc.xyz / sc.w;
+            // Map from [-1,1] to [0,1]
+            vec3 uvz = proj * 0.5 + 0.5;
+
+            // Outside shadow map => lit
+            if (uvz.x < 0.0 || uvz.x > 1.0 || uvz.y < 0.0 || uvz.y > 1.0) return 1.0;
+
+            // Depth compare with small bias
+            float bias = 0.0025;
+            // sampler2DShadow expects vec3(uv, depth)
+            return texture(uShadowMap, vec3(uvz.xy, uvz.z - bias));
+        }
+
         void main() {
-            oColor = uColor;
+            vec3 n = normalize(vNrm);
+            float ndl = max(dot(n, -uLightDir), 0.0);
+
+            vec3 tex = texture(uTex, vUV).rgb;
+            vec3 base = tex * uColor.rgb;
+
+            float sh = shadow_factor(vShadowCoord);
+            float ambient = 0.25;
+            float diffuse = 0.85 * ndl;
+
+            vec3 lit = base * (ambient + diffuse * sh);
+            oColor = vec4(lit, uColor.a);
         }
         """
+
+        # Shadow pass: depth only
+        shadow_vs = r"""
+        #version 330 core
+        layout(location=0) in vec3 aPos;
+        uniform mat4 uM;
+        uniform mat4 uLightVP;
+        void main() {
+            gl_Position = uLightVP * (uM * vec4(aPos, 1.0));
+        }
+        """
+        shadow_fs = r"""
+        #version 330 core
+        void main() { }
+        """
+
         vs = compile_shader(vs_src, GL.GL_VERTEX_SHADER)
         fs = compile_shader(fs_src, GL.GL_FRAGMENT_SHADER)
         self.prog = link_program(vs, fs)
         GL.glDeleteShader(vs)
         GL.glDeleteShader(fs)
 
-        self.uMVP = GL.glGetUniformLocation(self.prog, "uMVP")
+        svs = compile_shader(shadow_vs, GL.GL_VERTEX_SHADER)
+        sfs = compile_shader(shadow_fs, GL.GL_FRAGMENT_SHADER)
+        self.shadow_prog = link_program(svs, sfs)
+        GL.glDeleteShader(svs)
+        GL.glDeleteShader(sfs)
+
+        # Uniform locations
+        self.uM = GL.glGetUniformLocation(self.prog, "uM")
+        self.uVP = GL.glGetUniformLocation(self.prog, "uVP")
+        self.uLightVP = GL.glGetUniformLocation(self.prog, "uLightVP")
         self.uColor = GL.glGetUniformLocation(self.prog, "uColor")
+        self.uLightDir = GL.glGetUniformLocation(self.prog, "uLightDir")
+        self.uTex = GL.glGetUniformLocation(self.prog, "uTex")
+        self.uShadowMap = GL.glGetUniformLocation(self.prog, "uShadowMap")
 
-        self.vao_cube, self.vbo_cube, self.cube_count = self._make_unit_cube()
-        self.vao_plane, self.vbo_plane, self.plane_count = self._make_unit_plane()
+        self.s_uM = GL.glGetUniformLocation(self.shadow_prog, "uM")
+        self.s_uLightVP = GL.glGetUniformLocation(self.shadow_prog, "uLightVP")
 
-    def _make_unit_cube(self):
-        # Unit cube centered at origin, size 1
-        # 12 triangles => 36 verts
+    def _init_meshes(self):
+        # Cube and plane with normals+uv
+        self.vao_cube, self.vbo_cube, self.cube_count = self._make_cube()
+        self.vao_plane, self.vbo_plane, self.plane_count = self._make_plane()
+
+    def _make_cube(self):
+        # Position, Normal, UV (36 verts)
+        # UVs are simple; good enough for checker
+        data = []
+
+        def add_face(n, verts, uvs):
+            for (p, uv) in zip(verts, uvs):
+                data.extend([p[0], p[1], p[2], n[0], n[1], n[2], uv[0], uv[1]])
+
+        # Each face: two triangles (6 verts)
+        # +Z
+        add_face((0,0,1),
+                 [(-0.5,-0.5,0.5),(0.5,-0.5,0.5),(0.5,0.5,0.5),
+                  (-0.5,-0.5,0.5),(0.5,0.5,0.5),(-0.5,0.5,0.5)],
+                 [(0,0),(1,0),(1,1),(0,0),(1,1),(0,1)])
+        # -Z
+        add_face((0,0,-1),
+                 [(-0.5,-0.5,-0.5),(0.5,0.5,-0.5),(0.5,-0.5,-0.5),
+                  (-0.5,-0.5,-0.5),(-0.5,0.5,-0.5),(0.5,0.5,-0.5)],
+                 [(0,0),(1,1),(1,0),(0,0),(0,1),(1,1)])
+        # +X
+        add_face((1,0,0),
+                 [(0.5,-0.5,-0.5),(0.5,0.5,0.5),(0.5,-0.5,0.5),
+                  (0.5,-0.5,-0.5),(0.5,0.5,-0.5),(0.5,0.5,0.5)],
+                 [(0,0),(1,1),(1,0),(0,0),(0,1),(1,1)])
+        # -X
+        add_face((-1,0,0),
+                 [(-0.5,-0.5,-0.5),(-0.5,-0.5,0.5),(-0.5,0.5,0.5),
+                  (-0.5,-0.5,-0.5),(-0.5,0.5,0.5),(-0.5,0.5,-0.5)],
+                 [(0,0),(1,0),(1,1),(0,0),(1,1),(0,1)])
+        # +Y
+        add_face((0,1,0),
+                 [(-0.5,0.5,-0.5),(-0.5,0.5,0.5),(0.5,0.5,0.5),
+                  (-0.5,0.5,-0.5),(0.5,0.5,0.5),(0.5,0.5,-0.5)],
+                 [(0,0),(0,1),(1,1),(0,0),(1,1),(1,0)])
+        # -Y
+        add_face((0,-1,0),
+                 [(-0.5,-0.5,-0.5),(0.5,-0.5,0.5),(-0.5,-0.5,0.5),
+                  (-0.5,-0.5,-0.5),(0.5,-0.5,-0.5),(0.5,-0.5,0.5)],
+                 [(0,0),(1,1),(0,1),(0,0),(1,0),(1,1)])
+
+        v = np.array(data, dtype=np.float32)
+
+        vao = GL.glGenVertexArrays(1)
+        vbo = GL.glGenBuffers(1)
+
+        GL.glBindVertexArray(vao)
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
+        GL.glBufferData(GL.GL_ARRAY_BUFFER, v.nbytes, v, GL.GL_STATIC_DRAW)
+
+        stride = 8 * 4
+        GL.glEnableVertexAttribArray(0)
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, stride, ctypes.c_void_p(0))
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, False, stride, ctypes.c_void_p(12))
+        GL.glEnableVertexAttribArray(2)
+        GL.glVertexAttribPointer(2, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(24))
+
+        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
+        GL.glBindVertexArray(0)
+
+        return vao, vbo, int(len(v) / 8)
+
+    def _make_plane(self):
+        # Unit plane on XZ (y=0), normals up, UV tiled
         v = np.array([
-            # +Z
-            -0.5,-0.5, 0.5,  0.5,-0.5, 0.5,  0.5, 0.5, 0.5,
-            -0.5,-0.5, 0.5,  0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
-            # -Z
-            -0.5,-0.5,-0.5,  0.5, 0.5,-0.5,  0.5,-0.5,-0.5,
-            -0.5,-0.5,-0.5, -0.5, 0.5,-0.5,  0.5, 0.5,-0.5,
-            # +X
-             0.5,-0.5,-0.5,  0.5, 0.5, 0.5,  0.5,-0.5, 0.5,
-             0.5,-0.5,-0.5,  0.5, 0.5,-0.5,  0.5, 0.5, 0.5,
-            # -X
-            -0.5,-0.5,-0.5, -0.5,-0.5, 0.5, -0.5, 0.5, 0.5,
-            -0.5,-0.5,-0.5, -0.5, 0.5, 0.5, -0.5, 0.5,-0.5,
-            # +Y
-            -0.5, 0.5,-0.5, -0.5, 0.5, 0.5,  0.5, 0.5, 0.5,
-            -0.5, 0.5,-0.5,  0.5, 0.5, 0.5,  0.5, 0.5,-0.5,
-            # -Y
-            -0.5,-0.5,-0.5,  0.5,-0.5, 0.5, -0.5,-0.5, 0.5,
-            -0.5,-0.5,-0.5,  0.5,-0.5,-0.5,  0.5,-0.5, 0.5,
+            # pos            nrm        uv
+            -0.5,0.0,-0.5,   0,1,0,      0,0,
+             0.5,0.0,-0.5,   0,1,0,      4,0,
+             0.5,0.0, 0.5,   0,1,0,      4,4,
+
+            -0.5,0.0,-0.5,   0,1,0,      0,0,
+             0.5,0.0, 0.5,   0,1,0,      4,4,
+            -0.5,0.0, 0.5,   0,1,0,      0,4,
         ], dtype=np.float32)
 
         vao = GL.glGenVertexArrays(1)
         vbo = GL.glGenBuffers(1)
+
         GL.glBindVertexArray(vao)
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
         GL.glBufferData(GL.GL_ARRAY_BUFFER, v.nbytes, v, GL.GL_STATIC_DRAW)
+
+        stride = 8 * 4
         GL.glEnableVertexAttribArray(0)
-        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 12, ctypes.c_void_p(0))
+        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, stride, ctypes.c_void_p(0))
+        GL.glEnableVertexAttribArray(1)
+        GL.glVertexAttribPointer(1, 3, GL.GL_FLOAT, False, stride, ctypes.c_void_p(12))
+        GL.glEnableVertexAttribArray(2)
+        GL.glVertexAttribPointer(2, 2, GL.GL_FLOAT, False, stride, ctypes.c_void_p(24))
+
         GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
         GL.glBindVertexArray(0)
-        return vao, vbo, int(len(v)//3)
 
-    def _make_unit_plane(self):
-        # Unit quad in XY centered, z=0, two triangles
-        v = np.array([
-            -0.5,-0.5,0.0,  0.5,-0.5,0.0,  0.5, 0.5,0.0,
-            -0.5,-0.5,0.0,  0.5, 0.5,0.0, -0.5, 0.5,0.0,
-        ], dtype=np.float32)
+        return vao, vbo, int(len(v) / 8)
 
-        vao = GL.glGenVertexArrays(1)
-        vbo = GL.glGenBuffers(1)
-        GL.glBindVertexArray(vao)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, v.nbytes, v, GL.GL_STATIC_DRAW)
-        GL.glEnableVertexAttribArray(0)
-        GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 12, ctypes.c_void_p(0))
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, 0)
-        GL.glBindVertexArray(0)
-        return vao, vbo, int(len(v)//3)
+    def _init_checker_texture(self):
+        # Simple checkerboard texture (RGB)
+        tex = GL.glGenTextures(1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex)
 
-    def draw_cube(self, mvp, color_rgba):
-        GL.glUseProgram(self.prog)
-        GL.glUniformMatrix4fv(self.uMVP, 1, True, mvp)  # True => row-major numpy
-        GL.glUniform4f(self.uColor, *color_rgba)
-        GL.glBindVertexArray(self.vao_cube)
-        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self.cube_count)
+        w = h = 256
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        for y in range(h):
+            for x in range(w):
+                c = 40 if ((x // 16) ^ (y // 16)) & 1 else 200
+                img[y, x] = (c, c, c)
+
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGB8, w, h, 0, GL.GL_RGB, GL.GL_UNSIGNED_BYTE, img)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR_MIPMAP_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glGenerateMipmap(GL.GL_TEXTURE_2D)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+        self.checker_tex = tex
+
+    def _init_shadow_map(self):
+        self.shadow_fbo = GL.glGenFramebuffers(1)
+        self.shadow_tex = GL.glGenTextures(1)
+
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.shadow_tex)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_DEPTH_COMPONENT24,
+                        SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 0,
+                        GL.GL_DEPTH_COMPONENT, GL.GL_UNSIGNED_INT, None)
+
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+
+        # Important for sampler2DShadow
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_COMPARE_MODE, GL.GL_COMPARE_REF_TO_TEXTURE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_COMPARE_FUNC, GL.GL_LEQUAL)
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.shadow_fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT, GL.GL_TEXTURE_2D, self.shadow_tex, 0)
+        GL.glDrawBuffer(GL.GL_NONE)
+        GL.glReadBuffer(GL.GL_NONE)
+
+        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+        if status != GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError(f"Shadow FBO incomplete: {status}")
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+    def draw_shadow_pass(self, light_vp, draw_calls):
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.shadow_fbo)
+        GL.glViewport(0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE)
+        GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glCullFace(GL.GL_FRONT)  # helps reduce shadow acne
+        GL.glEnable(GL.GL_CULL_FACE)
+
+        GL.glUseProgram(self.shadow_prog)
+        GL.glUniformMatrix4fv(self.s_uLightVP, 1, True, light_vp)
+
+        for (mesh, M) in draw_calls:
+            GL.glUniformMatrix4fv(self.s_uM, 1, True, M)
+            vao, count = mesh
+            GL.glBindVertexArray(vao)
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, count)
+
         GL.glBindVertexArray(0)
         GL.glUseProgram(0)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
 
-    def draw_plane(self, mvp, color_rgba):
+    def draw_main_pass(self, vp, light_vp, draw_calls):
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthFunc(GL.GL_LESS)
+        GL.glCullFace(GL.GL_BACK)
+        GL.glEnable(GL.GL_CULL_FACE)
+
         GL.glUseProgram(self.prog)
-        GL.glUniformMatrix4fv(self.uMVP, 1, True, mvp)
-        GL.glUniform4f(self.uColor, *color_rgba)
-        GL.glBindVertexArray(self.vao_plane)
-        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self.plane_count)
+        GL.glUniformMatrix4fv(self.uVP, 1, True, vp)
+        GL.glUniformMatrix4fv(self.uLightVP, 1, True, light_vp)
+        GL.glUniform3f(self.uLightDir, float(LIGHT_DIR[0]), float(LIGHT_DIR[1]), float(LIGHT_DIR[2]))
+
+        # Bind checker texture
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.checker_tex)
+        GL.glUniform1i(self.uTex, 0)
+
+        # Bind shadow map
+        GL.glActiveTexture(GL.GL_TEXTURE1)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.shadow_tex)
+        GL.glUniform1i(self.uShadowMap, 1)
+
+        for (mesh, M, color) in draw_calls:
+            GL.glUniformMatrix4fv(self.uM, 1, True, M)
+            GL.glUniform4f(self.uColor, float(color[0]), float(color[1]), float(color[2]), float(color[3]))
+            vao, count = mesh
+            GL.glBindVertexArray(vao)
+            GL.glDrawArrays(GL.GL_TRIANGLES, 0, count)
+
         GL.glBindVertexArray(0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
         GL.glUseProgram(0)
+        GL.glDisable(GL.GL_CULL_FACE)
+
+    @property
+    def mesh_cube(self):
+        return (self.vao_cube, self.cube_count)
+
+    @property
+    def mesh_plane(self):
+        return (self.vao_plane, self.plane_count)
 
 
 # ==========================================================
-# OpenXR runtime (main process)
+# OpenXR runtime
 # ==========================================================
 class XrRuntime:
-    def __init__(self, title="VR OpenGL Game-Style"):
+    def __init__(self, title="VR OpenGL Game-Style + Shadows"):
         if platform.system() != "Windows":
             raise RuntimeError("Windows-only (WGL + SDL).")
 
@@ -306,7 +524,7 @@ class XrRuntime:
         if req not in avail:
             raise RuntimeError("XR_KHR_opengl_enable not available")
 
-        app_info = xr.ApplicationInfo("vr_opengl_game_style", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
+        app_info = xr.ApplicationInfo("vr_opengl_game_style_shadows", 1, "pyopenxr", 0, xr.XR_CURRENT_API_VERSION)
         self.instance = xr.create_instance(xr.InstanceCreateInfo(application_info=app_info, enabled_extension_names=[req]))
 
         self.system_id = xr.get_system(self.instance, xr.SystemGetInfo(xr.FormFactor.HEAD_MOUNTED_DISPLAY))
@@ -360,7 +578,7 @@ class XrRuntime:
 
         identity = xr.Posef(orientation=xr.Quaternionf(0, 0, 0, 1), position=xr.Vector3f(0, 0, 0))
 
-        # Prefer STAGE if available
+        # Prefer STAGE if available (stable world)
         try:
             self.reference_space = xr.create_reference_space(
                 self.session,
@@ -498,7 +716,7 @@ class XrRuntime:
         try: sdl2.SDL_Quit()
         except Exception: pass
 
-    def _dbg_print_changes(self, grip, trigger, a, b, sx, sy, pose_valid):
+    def dbg_inputs(self, grip, trigger, a, b, sx, sy, pose_valid):
         if not DEBUG_INPUTS:
             return
         last = self._dbg_last
@@ -508,10 +726,8 @@ class XrRuntime:
         if last["a"] is None or a != last["a"]: pr("Button A", int(a))
         if last["b"] is None or b != last["b"]: pr("Button B", int(b))
         if last["trig"] is None or abs(trigger - last["trig"]) > 0.05: pr("Trigger", f"{trigger:.2f}")
-        if last["sx"] is None or abs(sx - last["sx"]) > 0.20 or (abs(sx) < 0.05 and abs(last["sx"]) >= 0.05):
-            pr("Thumbstick X", f"{sx:.2f}")
-        if last["sy"] is None or abs(sy - last["sy"]) > 0.20 or (abs(sy) < 0.05 and abs(last["sy"]) >= 0.05):
-            pr("Thumbstick Y", f"{sy:.2f}")
+        if last["sx"] is None or abs(sx - last["sx"]) > 0.20: pr("Thumbstick X", f"{sx:.2f}")
+        if last["sy"] is None or abs(sy - last["sy"]) > 0.20: pr("Thumbstick Y", f"{sy:.2f}")
         if last["pose_valid"] is None or pose_valid != last["pose_valid"]: pr("Hand pose valid", int(pose_valid))
 
         last["grip"] = grip
@@ -524,15 +740,15 @@ class XrRuntime:
 
 
 # ==========================================================
-# "Simulation" state (replace with Genesis if needed)
+# Sim state
 # ==========================================================
 class SimState:
     def __init__(self):
-        self.active_idx = 0  # gray
-        self.last_cube_pos = START_POS.copy()
+        self.active_idx = 0
+        self.last_cube_pos_local = START_POS_LOCAL.copy()
         self.trigger = 0.0
 
-    def choose_color(self, button_a, button_b, stick_active, trigger):
+    def _choose_color(self, button_a, button_b, stick_active, trigger):
         desired = "gray"
         if button_a:
             desired = "red"
@@ -544,76 +760,114 @@ class SimState:
             desired = "green"
         return COLOR_NAMES.index(desired)
 
-    def update(self, grip, trigger, button_a, button_b, sx, sy, hand_pos):
+    def update(self, grip, trigger, button_a, button_b, sx, sy, hand_pos_world):
         stick_active = (abs(sx) > STICK_DEADZONE) or (abs(sy) > STICK_DEADZONE)
-        desired_idx = self.choose_color(button_a, button_b, stick_active, trigger)
-        if desired_idx != self.active_idx:
-            self.active_idx = desired_idx
-
+        self.active_idx = self._choose_color(button_a, button_b, stick_active, trigger)
         self.trigger = trigger
 
-        if grip and hand_pos is not None:
-            hx, hy, hz = hand_pos
-            gp = map_pos_xr_to_gen((hx, hy, hz), world_t=WORLD_T)
-            x = float(np.clip(gp[0], -0.45, 0.45))
-            y = float(np.clip(gp[1], -0.45, 0.45))
+        if grip and hand_pos_world is not None:
+            # Convert hand world position into our scene-local by subtracting SCENE_OFFSET
+            hp = np.array(hand_pos_world, dtype=np.float32) - SCENE_OFFSET
+
+            # Keep same "feel" as your Genesis example: constrain X/Y and drive Z from trigger
+            x = float(np.clip(hp[0], -0.45, 0.45))
+            y = float(np.clip(hp[1], -0.45, 0.45))
             z = float(RING_Z + 0.12 + 0.25 * trigger)
-            self.last_cube_pos[:] = (x, y, z)
+
+            self.last_cube_pos_local[:] = (x, y, z)
 
 
 # ==========================================================
-# Render scene objects (plane + rails + active cube)
+# Scene draw list builders
 # ==========================================================
-def draw_scene(renderer: SimpleRenderer, VP: np.ndarray, sim: SimState):
-    # Background clear
-    GL.glEnable(GL.GL_DEPTH_TEST)
-    GL.glDepthFunc(GL.GL_LESS)
+def build_scene_draw_calls(renderer: LitShadowRenderer, sim: SimState):
+    # Build object transforms in WORLD space (XR reference space), by adding SCENE_OFFSET.
+    calls_main = []
+    calls_shadow = []
 
-    # Ground plane (big)
-    plane_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    plane_scale = np.array([6.0, 6.0, 1.0], dtype=np.float32)
-    M_plane = mat4_translate(plane_pos) @ mat4_scale(plane_scale[0], plane_scale[1], plane_scale[2])
-    mvp_plane = VP @ M_plane
-    renderer.draw_plane(mvp_plane, (0.25, 0.25, 0.25, 1.0))
+    def world_M_from_local(center_local, size_xyz):
+        center_world = SCENE_OFFSET + np.array(center_local, dtype=np.float32)
+        return mat4_translate(center_world) @ mat4_scale(size_xyz[0], size_xyz[1], size_xyz[2])
 
-    # Rails (4 boxes)
-    rail_color = (0.35, 0.35, 0.35, 1.0)
-    # Each rail is drawn as a scaled cube
-    def draw_box(center, size_xyz):
-        M = mat4_translate(np.array(center, dtype=np.float32)) @ mat4_scale(size_xyz[0], size_xyz[1], size_xyz[2])
-        renderer.draw_cube(VP @ M, rail_color)
+    # Big ground plane (world)
+    # Put plane under scene, XZ plane, y = SCENE_OFFSET.y - 0.05
+    plane_center = np.array([0.0, -0.05, 0.0], dtype=np.float32) + SCENE_OFFSET
+    M_plane = mat4_translate(plane_center) @ mat4_scale(8.0, 1.0, 8.0)  # y scale unused for plane but ok
+    calls_main.append((renderer.mesh_plane, M_plane, (0.85, 0.85, 0.85, 1.0)))
+    calls_shadow.append((renderer.mesh_plane, M_plane))
 
+    # Rails (scaled cubes)
     ring_z = RING_Z
     ring_outer = RING_OUTER
     hole = HOLE
     plate_t = PLATE_T
     rail_w = RAIL_W
 
-    draw_box((0.0, -(hole/2.0 + rail_w/2.0), ring_z), (ring_outer, rail_w, plate_t))
-    draw_box((0.0, +(hole/2.0 + rail_w/2.0), ring_z), (ring_outer, rail_w, plate_t))
-    draw_box((-(hole/2.0 + rail_w/2.0), 0.0, ring_z), (rail_w, hole, plate_t))
-    draw_box((+(hole/2.0 + rail_w/2.0), 0.0, ring_z), (rail_w, hole, plate_t))
+    rail_color = (0.55, 0.55, 0.60, 1.0)
+
+    rails = [
+        ((0.0, -(hole/2.0 + rail_w/2.0), ring_z), (ring_outer, rail_w, plate_t)),
+        ((0.0, +(hole/2.0 + rail_w/2.0), ring_z), (ring_outer, rail_w, plate_t)),
+        ((-(hole/2.0 + rail_w/2.0), 0.0, ring_z), (rail_w, hole, plate_t)),
+        ((+(hole/2.0 + rail_w/2.0), 0.0, ring_z), (rail_w, hole, plate_t)),
+    ]
+    for c, s in rails:
+        M = world_M_from_local(c, s)
+        calls_main.append((renderer.mesh_cube, M, rail_color))
+        calls_shadow.append((renderer.mesh_cube, M))
 
     # Active cube
     cube_color = COLORS[COLOR_NAMES[sim.active_idx]]
-    cube_pos = sim.last_cube_pos
-    M_cube = mat4_translate(cube_pos) @ mat4_scale(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE)
-    renderer.draw_cube(VP @ M_cube, cube_color)
+    cube_center_world = SCENE_OFFSET + sim.last_cube_pos_local
+    M_cube = mat4_translate(cube_center_world) @ mat4_scale(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE)
+    calls_main.append((renderer.mesh_cube, M_cube, cube_color))
+    calls_shadow.append((renderer.mesh_cube, M_cube))
+
+    return calls_main, calls_shadow
+
+
+def compute_light_vp():
+    # Directional light: build an orthographic light view around the scene area.
+    # Center around SCENE_OFFSET.
+    center = SCENE_OFFSET + np.array([0.0, 0.0, 0.4], dtype=np.float32)
+    light_pos = center - LIGHT_DIR * 4.0
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    if abs(np.dot(up, LIGHT_DIR)) > 0.95:
+        up = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+
+    V = look_at(light_pos, center, up)
+
+    # Ortho bounds big enough for the ring area
+    l, r = -2.5, 2.5
+    b, t = -2.5, 2.5
+    n, f = 0.1, 10.0
+
+    P = np.array([
+        [2/(r-l), 0,       0,       -(r+l)/(r-l)],
+        [0,       2/(t-b), 0,       -(t+b)/(t-b)],
+        [0,       0,      -2/(f-n), -(f+n)/(f-n)],
+        [0,       0,       0,        1],
+    ], dtype=np.float32)
+
+    return P @ V
 
 
 # ==========================================================
-# Main loop
+# Main
 # ==========================================================
 def main():
-    rt = XrRuntime("VR OpenGL Game-Style (no readback)")
+    if platform.system() != "Windows":
+        raise RuntimeError("Windows-only (WGL + SDL).")
+
+    rt = XrRuntime("VR OpenGL Game-Style + Shadows (Fixed Stereo)")
+    renderer = LitShadowRenderer()
+    sim = SimState()
 
     print("[Config]")
-    print("  WORLD_T =", WORLD_T, "MAPPING =", MAPPING)
-    print("  EYE_SEP_SCALE =", EYE_SEP_SCALE, "SWAP_EYES =", SWAP_EYES)
+    print("  SCENE_OFFSET =", tuple(float(x) for x in SCENE_OFFSET))
+    print("  SWAP_EYES =", SWAP_EYES)
     print("  DEBUG_INPUTS =", DEBUG_INPUTS)
-
-    renderer = SimpleRenderer()
-    sim = SimState()
+    print("  NOTE: Stereo is correct ONLY if you do NOT scale IPD (we don't).")
 
     sdl_event = sdl2.SDL_Event()
     running = True
@@ -675,9 +929,9 @@ def main():
         except Exception:
             pass
 
-        rt._dbg_print_changes(grip, trigger, button_a, button_b, sx, sy, pose_valid)
+        rt.dbg_inputs(grip, trigger, button_a, button_b, sx, sy, pose_valid)
 
-        # Views
+        # Views (per-eye pose + fov from runtime)
         try:
             _, located_views = xr.locate_views(
                 rt.session,
@@ -693,14 +947,15 @@ def main():
                                                      layers=[]))
             continue
 
-        # Update "sim" (replace with Genesis physics update if desired)
+        # Update sim
         sim.update(grip, trigger, button_a, button_b, sx, sy, hand_pos)
 
-        # Eye separation scaling (keep your old behavior)
-        head = None
-        p0 = located_views[0].pose.position
-        p1 = located_views[1].pose.position
-        head = 0.5 * np.array([p0.x + p1.x, p0.y + p1.y, p0.z + p1.z], dtype=np.float32)
+        # Build draw calls and shadow matrix
+        light_vp = compute_light_vp()
+        calls_main, calls_shadow = build_scene_draw_calls(renderer, sim)
+
+        # Shadow pass once per frame (shared for both eyes)
+        renderer.draw_shadow_pass(light_vp, calls_shadow)
 
         proj_views = []
         for eye_index, sc in enumerate(rt.swapchains):
@@ -714,49 +969,29 @@ def main():
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, rt.fbo)
             GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, gl_image, 0)
 
-            # Depth buffer
+            # Depth buffer for main render
             GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, rt.depth_rb)
             GL.glRenderbufferStorage(GL.GL_RENDERBUFFER, GL.GL_DEPTH_COMPONENT24, w, h)
             GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT, GL.GL_RENDERBUFFER, rt.depth_rb)
 
             GL.glViewport(0, 0, w, h)
-            GL.glClearColor(0.05, 0.05, 0.06, 1.0)
+            GL.glClearColor(0.07, 0.08, 0.10, 1.0)
             GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
 
-            # Build projection from OpenXR FOV
-            P = openxr_projection_from_fov(located_views[eye_index].fov, near=0.05, far=100.0)
+            # Projection from OpenXR per-eye fov
+            P = openxr_projection_from_fov(located_views[eye_index].fov, near=0.05, far=50.0)
 
-            # Build view from OpenXR pose
+            # View: inverse of eye pose in reference space (this is the big fix for "world moves")
             p = located_views[eye_index].pose.position
             q = located_views[eye_index].pose.orientation
+            R = quat_to_rotmat_xyzw(q.x, q.y, q.z, q.w)
+            tpos = np.array([p.x, p.y, p.z], dtype=np.float32)
 
-            # Apply your EYE_SEP_SCALE (optional, matches original code intent)
-            pi = np.array([p.x, p.y, p.z], dtype=np.float32)
-            pi = head + EYE_SEP_SCALE * (pi - head)
-
-            R_xr = quat_to_rotmat_xyzw(q.x, q.y, q.z, q.w)
-            t_xr = pi
-
-            # Convert to your "genesis/world" mapping
-            # We map basis vectors through map_vec_xr_to_gen, and position through map_pos_xr_to_gen
-            right = map_vec_xr_to_gen(R_xr[:, 0])
-            up    = map_vec_xr_to_gen(R_xr[:, 1])
-            fwd   = map_vec_xr_to_gen(-R_xr[:, 2])  # forward
-
-            # Re-orthonormalize to be safe
-            fwd = normalize(fwd)
-            right = normalize(np.cross(up, fwd))
-            up = normalize(np.cross(fwd, right))
-
-            Rg = np.stack([right, up, fwd], axis=1).astype(np.float32)
-            tg = map_pos_xr_to_gen((t_xr[0], t_xr[1], t_xr[2]), world_t=WORLD_T)
-
-            V = mat4_inverse_rt(Rg, tg)
-
+            V = mat4_inverse_rt(R, tpos)
             VP = P @ V
 
-            # Draw world
-            draw_scene(renderer, VP, sim)
+            # Main draw
+            renderer.draw_main_pass(VP, light_vp, calls_main)
 
             GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
             xr.release_swapchain_image(sc, xr.SwapchainImageReleaseInfo())
