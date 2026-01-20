@@ -3,19 +3,26 @@ vr_xr_runtime.py
 
 Reusable OpenXR + SDL2 + OpenGL runtime for Meta Quest (Link) on Windows.
 
-- XrActionsState: simple container for right-hand controller state
-- XrRuntime: wraps OpenXR + SDL + GL
-- Running this file directly starts a demo:
+Adds:
+- Right-hand pose publishing:
+    actions.right_pos = (x,y,z)  # meters in LOCAL space
+Prefers:
+- aim pose (/input/aim/pose)
+Fallback:
+- grip pose (/input/grip/pose)
+
+Running this file directly starts a demo:
     * blue left / red right
     * prints Grip / Trigger / Button A / Button B on changes
+    * prints right_pos occasionally when valid
 """
 
 import ctypes
 import os
 import platform
-import sys
 import time
 from dataclasses import dataclass
+from typing import Optional, Tuple
 
 import xr  # pyopenxr
 
@@ -29,7 +36,7 @@ import sdl2
 from OpenGL import WGL
 from OpenGL import GL
 
-
+DEBUG = False
 def _to_str(x):
     if isinstance(x, bytes):
         return x.decode("utf-8", errors="ignore")
@@ -44,6 +51,10 @@ class XrActionsState:
     button_a: bool = False
     button_b: bool = False
 
+    # NEW: right-hand pose (LOCAL space)
+    right_pos: Optional[Tuple[float, float, float]] = None
+    right_pose: Optional[xr.Posef] = None  # full pose if you ever want orientation too
+
 
 class XrRuntime:
     """
@@ -52,13 +63,10 @@ class XrRuntime:
       - SDL2 window + OpenGL context
       - Swapchains per eye
       - Right-hand actions: grip, trigger, A, B
-
-    You call:
-        runtime = XrRuntime()
-        runtime.run(per_frame=..., per_eye=...)
+      - Right-hand pose: aim pose (preferred) + grip pose (fallback)
 
     per_frame(actions: XrActionsState) is called once per XR frame.
-    per_eye(eye_index, pose, fov, fbo, width, height) is called per eye.
+    per_eye(...) is called per eye.
     """
 
     def __init__(self, window_title: str = "OpenXR Runtime", log_setup: bool = True):
@@ -66,6 +74,7 @@ class XrRuntime:
             raise RuntimeError("XrRuntime is written for Windows (OpenGL + WGL).")
 
         self.log_setup = log_setup
+        self._pose_debug = True  # keep this ON for now (non-spammy prints)
 
         if self.log_setup:
             print("=== XrRuntime: init ===")
@@ -242,14 +251,14 @@ class XrRuntime:
         # --- 8) Reference space (LOCAL) ---
         identity_orientation = xr.Quaternionf(0.0, 0.0, 0.0, 1.0)
         identity_position = xr.Vector3f(0.0, 0.0, 0.0)
-        identity_pose = xr.Posef(
+        self.identity_pose = xr.Posef(
             orientation=identity_orientation,
             position=identity_position,
         )
 
         ref_space_info = xr.ReferenceSpaceCreateInfo(
             reference_space_type=xr.ReferenceSpaceType.LOCAL,
-            pose_in_reference_space=identity_pose,
+            pose_in_reference_space=self.identity_pose,
         )
         self.reference_space = xr.create_reference_space(self.session, ref_space_info)
         if self.log_setup:
@@ -285,9 +294,7 @@ class XrRuntime:
             if self.log_setup:
                 print(f"✅ Created swapchain for eye {i}: {sc}")
 
-            images = xr.enumerate_swapchain_images(
-                sc, xr.SwapchainImageOpenGLKHR
-            )
+            images = xr.enumerate_swapchain_images(sc, xr.SwapchainImageOpenGLKHR)
             if self.log_setup:
                 print(f"   Swapchain {i} has {len(images)} images.")
             self.swapchains.append(sc)
@@ -296,7 +303,7 @@ class XrRuntime:
 
         self.fbo = GL.glGenFramebuffers(1)
 
-        # --- 10) Actions (right hand grip/trigger/A/B) ---
+        # --- 10) Actions (right hand grip/trigger/A/B + POSE) ---
         if self.log_setup:
             print("\nCreating action set + actions...")
 
@@ -309,6 +316,7 @@ class XrRuntime:
 
         self.right_hand_path = xr.string_to_path(self.instance, "/user/hand/right")
 
+        # Button/axis actions
         self.grip_action = xr.create_action(
             self.action_set,
             xr.ActionCreateInfo(
@@ -349,6 +357,29 @@ class XrRuntime:
             ),
         )
 
+        # NEW: Pose actions (aim preferred, grip fallback)
+        # NOTE: some pyopenxr builds name this ActionType.POSE_INPUT; if yours differs,
+        # check xr.ActionType enums.
+        self.right_aim_pose_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(
+                action_name="right_aim_pose",
+                action_type=xr.ActionType.POSE_INPUT,
+                localized_action_name="Right Aim Pose",
+                subaction_paths=[self.right_hand_path],
+            ),
+        )
+        self.right_grip_pose_action = xr.create_action(
+            self.action_set,
+            xr.ActionCreateInfo(
+                action_name="right_grip_pose",
+                action_type=xr.ActionType.POSE_INPUT,
+                localized_action_name="Right Grip Pose",
+                subaction_paths=[self.right_hand_path],
+            ),
+        )
+
+        # Bindings (Oculus Touch)
         oculus_touch_profile = xr.string_to_path(
             self.instance, "/interaction_profiles/oculus/touch_controller"
         )
@@ -378,6 +409,20 @@ class XrRuntime:
                     self.instance, "/user/hand/right/input/b/click"
                 ),
             ),
+
+            # NEW: pose bindings
+            xr.ActionSuggestedBinding(
+                action=self.right_aim_pose_action,
+                binding=xr.string_to_path(
+                    self.instance, "/user/hand/right/input/aim/pose"
+                ),
+            ),
+            xr.ActionSuggestedBinding(
+                action=self.right_grip_pose_action,
+                binding=xr.string_to_path(
+                    self.instance, "/user/hand/right/input/grip/pose"
+                ),
+            ),
         ]
 
         ip_suggest_info = xr.InteractionProfileSuggestedBinding(
@@ -386,19 +431,15 @@ class XrRuntime:
         )
         xr.suggest_interaction_profile_bindings(self.instance, ip_suggest_info)
         if self.log_setup:
-            print("✅ Suggested bindings for Oculus Touch.")
+            print("✅ Suggested bindings for Oculus Touch (including aim/grip pose).")
 
-        attach_info = xr.SessionActionSetsAttachInfo(
-            action_sets=[self.action_set]
-        )
+        attach_info = xr.SessionActionSetsAttachInfo(action_sets=[self.action_set])
         xr.attach_session_action_sets(self.session, attach_info)
         if self.log_setup:
             print("✅ Attached action set to session.")
 
         # --- 11) Begin session ---
-        begin_info = xr.SessionBeginInfo(
-            primary_view_configuration_type=self.view_config_type
-        )
+        begin_info = xr.SessionBeginInfo(primary_view_configuration_type=self.view_config_type)
         xr.begin_session(self.session, begin_info)
         if self.log_setup:
             print("✅ Began XR session.")
@@ -408,11 +449,36 @@ class XrRuntime:
             subaction_path=xr.NULL_PATH,
         )
 
+        # Create action spaces for pose actions (now that session exists)
+        # These are the spaces we locate each frame to get controller position.
+        self.right_aim_space = xr.create_action_space(
+            self.session,
+            xr.ActionSpaceCreateInfo(
+                action=self.right_aim_pose_action,
+                subaction_path=self.right_hand_path,
+                pose_in_action_space=self.identity_pose,
+            ),
+        )
+        self.right_grip_space = xr.create_action_space(
+            self.session,
+            xr.ActionSpaceCreateInfo(
+                action=self.right_grip_pose_action,
+                subaction_path=self.right_hand_path,
+                pose_in_action_space=self.identity_pose,
+            ),
+        )
+        if self.log_setup:
+            print("✅ Created right-hand action spaces (aim + grip).")
+
         self.environment_blend_mode = xr.EnvironmentBlendMode.OPAQUE
         self.session_running = True
 
+        # Debug: print pose validity changes without spamming
+        self._last_pose_valid = None
+        self._last_pose_print_t = 0.0
+
     # ------------------------------------------------------------------
-    # Helper methods
+    # Helpers
     # ------------------------------------------------------------------
 
     def _choose_swapchain_format(self, session):
@@ -428,7 +494,6 @@ class XrRuntime:
         return available_formats[0]
 
     def _cleanup_basic(self):
-        """Cleanup used when we fail early."""
         try:
             sdl2.SDL_GL_DeleteContext(self.gl_context)
         except Exception:
@@ -446,8 +511,53 @@ class XrRuntime:
         except Exception:
             pass
 
+    def _locate_right_pose(self, predicted_display_time, actions_state: XrActionsState):
+        """
+        Fill actions_state.right_pos + right_pose by locating aim space first, then grip space.
+        """
+        def locate(space):
+            try:
+                loc = xr.locate_space(space, self.reference_space, predicted_display_time)
+                return loc
+            except Exception:
+                return None
+
+        loc = locate(self.right_aim_space)
+        used = "aim"
+
+        # If aim isn't valid, try grip
+        if loc is None or not (loc.location_flags & xr.SpaceLocationFlags.POSITION_VALID_BIT):
+            loc2 = locate(self.right_grip_space)
+            if loc2 is not None and (loc2.location_flags & xr.SpaceLocationFlags.POSITION_VALID_BIT):
+                loc = loc2
+                used = "grip"
+
+        if loc is not None and (loc.location_flags & xr.SpaceLocationFlags.POSITION_VALID_BIT):
+            p = loc.pose.position
+            actions_state.right_pos = (float(p.x), float(p.y), float(p.z))
+            actions_state.right_pose = loc.pose
+
+            # Non-spammy debug: print validity toggles and occasional positions
+            if self._pose_debug:
+                now = time.time()
+                valid = True
+                if self._last_pose_valid is not True:
+                    print(f"[XR POSE] right pose VALID (using {used})")
+                # Print position about ~2x/sec
+                if (now - self._last_pose_print_t > 0.5) and DEBUG:
+                    self._last_pose_print_t = now
+                    print(f"[XR POSE] {used} right_pos = {actions_state.right_pos}")
+                self._last_pose_valid = valid
+        else:
+            actions_state.right_pos = None
+            actions_state.right_pose = None
+            if self._pose_debug:
+                valid = False
+                if self._last_pose_valid is not False:
+                    print("[XR POSE] right pose NOT valid (aim+grip)")
+                self._last_pose_valid = valid
+
     def shutdown(self):
-        """Explicit shutdown; safe to call multiple times."""
         if getattr(self, "_shutdown_done", False):
             return
         self._shutdown_done = True
@@ -498,7 +608,6 @@ class XrRuntime:
             print("✅ Clean exit.")
 
     def __del__(self):
-        # Best-effort cleanup if user forgets to call shutdown().
         try:
             self.shutdown()
         except Exception:
@@ -509,24 +618,6 @@ class XrRuntime:
     # ------------------------------------------------------------------
 
     def run(self, per_frame=None, per_eye=None):
-        """
-        Main XR loop.
-
-        Args:
-            per_frame: callable(actions: XrActionsState) -> None
-            per_eye: callable(
-                eye_index: int,
-                pose: xr.Posef,
-                fov: xr.Fovf,
-                fbo: int,
-                width: int,
-                height: int,
-            ) -> None
-
-        If per_eye is None, default rendering is:
-            - left eye = blue clear
-            - right eye = red clear
-        """
         if not self.session_running:
             raise RuntimeError("XR session is not running")
 
@@ -538,7 +629,7 @@ class XrRuntime:
         printed_unfocused_warning = False
 
         while running:
-            # --- SDL events (window + ESC) ---
+            # --- SDL events ---
             while sdl2.SDL_PollEvent(ctypes.byref(sdl_event)) != 0:
                 if sdl_event.type == sdl2.SDL_QUIT:
                     running = False
@@ -547,11 +638,10 @@ class XrRuntime:
                     if sdl_event.key.keysym.sym == sdl2.SDLK_ESCAPE:
                         running = False
                         break
-
             if not running:
                 break
 
-            # --- XR events: show state changes (not spammy) ---
+            # --- XR events ---
             while True:
                 try:
                     event = xr.poll_event(self.instance)
@@ -565,9 +655,7 @@ class XrRuntime:
             xr.begin_frame(self.session)
 
             # --- Sync actions ---
-            sync_info = xr.ActionsSyncInfo(
-                active_action_sets=[self.active_action_set]
-            )
+            sync_info = xr.ActionsSyncInfo(active_action_sets=[self.active_action_set])
             try:
                 xr.sync_actions(self.session, sync_info)
             except xr.exception.SessionNotFocused:
@@ -584,31 +672,19 @@ class XrRuntime:
             try:
                 grip_state = xr.get_action_state_boolean(
                     self.session,
-                    xr.ActionStateGetInfo(
-                        action=self.grip_action,
-                        subaction_path=xr.NULL_PATH,
-                    ),
+                    xr.ActionStateGetInfo(action=self.grip_action, subaction_path=xr.NULL_PATH),
                 )
                 trigger_state = xr.get_action_state_float(
                     self.session,
-                    xr.ActionStateGetInfo(
-                        action=self.trigger_action,
-                        subaction_path=xr.NULL_PATH,
-                    ),
+                    xr.ActionStateGetInfo(action=self.trigger_action, subaction_path=xr.NULL_PATH),
                 )
                 a_state = xr.get_action_state_boolean(
                     self.session,
-                    xr.ActionStateGetInfo(
-                        action=self.button_a_action,
-                        subaction_path=xr.NULL_PATH,
-                    ),
+                    xr.ActionStateGetInfo(action=self.button_a_action, subaction_path=xr.NULL_PATH),
                 )
                 b_state = xr.get_action_state_boolean(
                     self.session,
-                    xr.ActionStateGetInfo(
-                        action=self.button_b_action,
-                        subaction_path=xr.NULL_PATH,
-                    ),
+                    xr.ActionStateGetInfo(action=self.button_b_action, subaction_path=xr.NULL_PATH),
                 )
 
                 actions_state.grip = bool(grip_state.current_state)
@@ -619,12 +695,19 @@ class XrRuntime:
             except Exception as e:
                 print("[XR] get_action_state error:", repr(e))
 
+            # --- NEW: locate right controller pose into actions_state.right_pos ---
+            self._locate_right_pose(frame_state.predicted_display_time, actions_state)
+
             # --- User per-frame callback ---
             if per_frame is not None:
-                per_frame(actions_state)
+                keep_running = per_frame(actions_state)
+                if keep_running is False:
+                    # allow callers (calibration) to terminate the XR loop
+                    break
+
 
             frame_index += 1
-            if frame_index % 600 == 0:
+            if frame_index % 600 == 0 and DEBUG:
                 print(f"[FRAME] {frame_index} frames rendered")
 
             # --- Views + rendering ---
@@ -672,7 +755,6 @@ class XrRuntime:
                         h,
                     )
                 else:
-                    # Default demo: blue left, red right
                     if eye_index == 0:
                         GL.glClearColor(0.0, 0.0, 1.0, 1.0)
                     else:
@@ -716,7 +798,6 @@ class XrRuntime:
 
             time.sleep(0.001)
 
-        # Loop exited
         self.session_running = False
 
 
@@ -724,9 +805,7 @@ class XrRuntime:
 # Demo entry point
 # ----------------------------------------------------------------------
 
-
 def _demo_per_frame(actions: XrActionsState):
-    """Print input changes like your previous working script."""
     if not hasattr(_demo_per_frame, "_last"):
         _demo_per_frame._last = XrActionsState()
 
@@ -749,13 +828,14 @@ def _demo_per_frame(actions: XrActionsState):
         trigger=actions.trigger,
         button_a=actions.button_a,
         button_b=actions.button_b,
+        right_pos=actions.right_pos,
+        right_pose=actions.right_pose,
     )
 
 
 def main():
-    runtime = XrRuntime(window_title="OpenXR Runtime Demo")
+    runtime = XrRuntime(window_title="OpenXR Runtime Demo (with Pose)")
     try:
-        # per_eye=None → default blue/red clear
         runtime.run(per_frame=_demo_per_frame, per_eye=None)
     finally:
         runtime.shutdown()

@@ -1,26 +1,30 @@
-# vr_genesis_bridge.py
+# vr_genesis_bridge_full.py
 #
-# Full fix for "black in headset" after shadow FBO usage:
-#   - Shadow FBO sets glDrawBuffer(GL_NONE) / glReadBuffer(GL_NONE)
-#   - If you don't restore draw/read buffers on the swapchain FBO, your clears/draws can write to NONE → black.
+# Fixes + features requested:
+#   1) Controllers/input keep working after removing/putting headset back on
+#      - Properly handles OpenXR session lifecycle via SESSION_STATE_CHANGED events
+#      - Only calls xrWaitFrame/xrBeginFrame while session is RUNNING
+#      - Re-begins session when runtime returns to READY (after STOPPING)
+#      - Gates input on FOCUSED state (recommended for Quest Link)
 #
-# Fixes included:
-#   1) Genesis is built BEFORE OpenXR session (avoids GL context / share-group mismatch).
-#   2) Always enforce our SDL GL context current each frame.
-#   3) After attaching swapchain texture, explicitly set draw/read buffer to COLOR_ATTACHMENT0.
-#   4) Check FBO completeness (prints once if incomplete).
-#   5) Respect frame_state.should_render (when available).
-#   6) Numpy 2.x deprecation warnings avoided via np.asarray(...).astype(..., copy=False)
+#   2) 2D "Genesis visualization" inside VR while staying focused
+#      - Renders a spectator camera view (your proxy scene) to an offscreen texture (FBO)
+#      - Displays that texture on a floating quad in front of the HMD
 #
-# Robot drawing:
-#   - Franka rendered as link-proxy cubes via get_links_pos/get_links_quat.
+#   3) Keeps the "black headset after shadow FBO" fix
+#      - Restores glDrawBuffer/glReadBuffer to COLOR_ATTACHMENT0 on swapchain FBO
 #
-# Windows-only (WGL + SDL).
+# Notes:
+#   - This shows a 2D view of the SAME proxy scene you're already rendering (plane/cube/franka links).
+#     It does NOT use Genesis' own GUI viewer window.
+#
+# Windows-only (WGL + SDL). Requires: pyopenxr (import xr), PyOpenGL, pysdl2, genesis.
 
 import ctypes
 import os
 import platform
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -74,6 +78,14 @@ class AppConfig:
 
     # Robot proxy draw
     robot_link_box_size: float = 0.03
+
+    # 2D spectator view (render-to-texture)
+    spectator_tex_size: int = 1024
+    screen_distance_m: float = 0.85   # distance in front of head
+    screen_width_m: float = 1.25      # physical width in meters
+    screen_height_m: float = 0.75     # physical height in meters
+    screen_down_m: float = 0.12       # place slightly below eye
+    show_screen: bool = True          # can be toggled easily later
 
     # Palette
     color_names: Tuple[str, ...] = ("gray", "red", "blue", "green", "yellow")
@@ -174,6 +186,17 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     return M
 
 
+def perspective(fovy_rad: float, aspect: float, near: float, far: float) -> np.ndarray:
+    f = 1.0 / math.tan(fovy_rad * 0.5)
+    M = np.zeros((4, 4), dtype=np.float32)
+    M[0, 0] = f / aspect
+    M[1, 1] = f
+    M[2, 2] = (far + near) / (near - far)
+    M[2, 3] = (2 * far * near) / (near - far)
+    M[3, 2] = -1.0
+    return M
+
+
 # ==========================================================
 # GL helpers
 # ==========================================================
@@ -215,7 +238,69 @@ class DrawItem:
 
 
 # ==========================================================
-# Renderer (textured + shadows)
+# Offscreen spectator (render-to-texture) target
+# ==========================================================
+class Spectator2D:
+    def __init__(self, size: int = 1024):
+        self.w = int(size)
+        self.h = int(size)
+
+        self.fbo = GL.glGenFramebuffers(1)
+        self.tex = GL.glGenTextures(1)
+        self.depth = GL.glGenRenderbuffers(1)
+
+        # Color texture
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self.tex)
+        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_RGBA8, self.w, self.h, 0, GL.GL_RGBA, GL.GL_UNSIGNED_BYTE, None)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+
+        # Depth renderbuffer
+        GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, self.depth)
+        GL.glRenderbufferStorage(GL.GL_RENDERBUFFER, GL.GL_DEPTH_COMPONENT24, self.w, self.h)
+        GL.glBindRenderbuffer(GL.GL_RENDERBUFFER, 0)
+
+        # FBO attach
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, self.tex, 0)
+        GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT, GL.GL_RENDERBUFFER, self.depth)
+
+        GL.glDrawBuffer(GL.GL_COLOR_ATTACHMENT0)
+        GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
+
+        status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
+        if status != GL.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError(f"Spectator FBO incomplete: {hex(int(status))}")
+
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+
+    def bind(self):
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.fbo)
+        GL.glViewport(0, 0, self.w, self.h)
+        # Safety: make sure buffers are correct (some other pass might set NONE)
+        GL.glDrawBuffer(GL.GL_COLOR_ATTACHMENT0)
+        GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
+
+    def unbind(self):
+        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
+
+
+def make_spectator_vp(cfg: AppConfig) -> np.ndarray:
+    # A stable 2D-ish camera for your scene (feel free to tweak)
+    eye = cfg.scene_offset + np.array([1.35, 0.55, 1.35], dtype=np.float32)
+    target = cfg.scene_offset + np.array([0.0, 0.05, 0.25], dtype=np.float32)
+    up = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    V = look_at(eye, target, up)
+    P = perspective(math.radians(55.0), aspect=1.0, near=cfg.near, far=cfg.far)
+    return P @ V
+
+
+# ==========================================================
+# Renderer (textured + shadows + screen quad)
 # ==========================================================
 class Renderer:
     def __init__(self, cfg: AppConfig):
@@ -227,6 +312,7 @@ class Renderer:
         self._init_shadow_map()
 
     def _init_programs(self) -> None:
+        # Main + shadow programs (same as your working version)
         vs_src = r"""
         #version 330 core
         layout(location=0) in vec3 aPos;
@@ -322,6 +408,42 @@ class Renderer:
 
         self.s_uM = GL.glGetUniformLocation(self.shadow_prog, "uM")
         self.s_uLightVP = GL.glGetUniformLocation(self.shadow_prog, "uLightVP")
+
+        # Screen quad program (unlit texture)
+        screen_vs = r"""
+        #version 330 core
+        layout(location=0) in vec3 aPos;
+        layout(location=2) in vec2 aUV;
+
+        uniform mat4 uM;
+        uniform mat4 uVP;
+
+        out vec2 vUV;
+
+        void main() {
+            vUV = aUV;
+            gl_Position = uVP * (uM * vec4(aPos, 1.0));
+        }
+        """
+        screen_fs = r"""
+        #version 330 core
+        in vec2 vUV;
+        uniform sampler2D uScreenTex;
+        out vec4 oColor;
+        void main() {
+            oColor = texture(uScreenTex, vUV);
+        }
+        """
+
+        pvs = compile_shader(screen_vs, GL.GL_VERTEX_SHADER)
+        pfs = compile_shader(screen_fs, GL.GL_FRAGMENT_SHADER)
+        self.screen_prog = link_program(pvs, pfs)
+        GL.glDeleteShader(pvs)
+        GL.glDeleteShader(pfs)
+
+        self.screen_uM = GL.glGetUniformLocation(self.screen_prog, "uM")
+        self.screen_uVP = GL.glGetUniformLocation(self.screen_prog, "uVP")
+        self.screen_uTex = GL.glGetUniformLocation(self.screen_prog, "uScreenTex")
 
     def _init_meshes(self) -> None:
         self.mesh_cube = self._make_cube()
@@ -428,56 +550,16 @@ class Renderer:
         return MeshHandle(vao=vao, count=int(len(v) / 8))
 
     def _make_plane(self) -> MeshHandle:
+        # Plane in XZ, centered at origin, y=0. UVs 0..4 (we'll still sample fine).
         v = np.array(
             [
-                -0.5,
-                0.0,
-                -0.5,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0.5,
-                0.0,
-                -0.5,
-                0,
-                1,
-                0,
-                4,
-                0,
-                0.5,
-                0.0,
-                0.5,
-                0,
-                1,
-                0,
-                4,
-                4,
-                -0.5,
-                0.0,
-                -0.5,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0.5,
-                0.0,
-                0.5,
-                0,
-                1,
-                0,
-                4,
-                4,
-                -0.5,
-                0.0,
-                0.5,
-                0,
-                1,
-                0,
-                0,
-                4,
+                -0.5, 0.0, -0.5,  0, 1, 0,  0, 0,
+                 0.5, 0.0, -0.5,  0, 1, 0,  4, 0,
+                 0.5, 0.0,  0.5,  0, 1, 0,  4, 4,
+
+                -0.5, 0.0, -0.5,  0, 1, 0,  0, 0,
+                 0.5, 0.0,  0.5,  0, 1, 0,  4, 4,
+                -0.5, 0.0,  0.5,  0, 1, 0,  0, 4,
             ],
             dtype=np.float32,
         )
@@ -610,6 +692,27 @@ class Renderer:
         GL.glUseProgram(0)
         GL.glDisable(GL.GL_CULL_FACE)
 
+    def draw_screen_quad(self, vp: np.ndarray, M: np.ndarray, tex_id: int) -> None:
+        # Draw a textured quad (uses mesh_plane)
+        GL.glDisable(GL.GL_CULL_FACE)
+        GL.glEnable(GL.GL_DEPTH_TEST)
+        GL.glDepthFunc(GL.GL_LESS)
+
+        GL.glUseProgram(self.screen_prog)
+        GL.glUniformMatrix4fv(self.screen_uVP, 1, True, vp)
+        GL.glUniformMatrix4fv(self.screen_uM, 1, True, M)
+
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, tex_id)
+        GL.glUniform1i(self.screen_uTex, 0)
+
+        GL.glBindVertexArray(self.mesh_plane.vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, self.mesh_plane.count)
+
+        GL.glBindVertexArray(0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, 0)
+        GL.glUseProgram(0)
+
 
 # ==========================================================
 # XR runtime
@@ -632,6 +735,12 @@ class XrRuntime:
             raise RuntimeError("Windows-only (WGL + SDL).")
 
         self.cfg = cfg
+
+        # Session lifecycle flags (this fixes your headset-remove/reput bug)
+        self.session_state = xr.SessionState.IDLE
+        self.session_running = False
+        self.exit_requested = False
+
         self._init_xr()
         self._init_window_gl()
         self._init_session()
@@ -639,13 +748,17 @@ class XrRuntime:
         self._init_swapchains()
         self._init_fbo_depth()
         self._init_actions()
-        self._begin()
+
+        self.environment_blend_mode = xr.EnvironmentBlendMode.OPAQUE
 
         self._dbg_last = {"grip": None, "a": None, "b": None, "trig": None, "sx": None, "sy": None, "pose_valid": None}
 
         # Store the context that OpenXR session was bound to
         self.hdc = WGL.wglGetCurrentDC()
         self.hglrc = WGL.wglGetCurrentContext()
+
+        # Poll initial events once; many runtimes will quickly go to READY
+        self.poll_xr_events()
 
     def _init_xr(self) -> None:
         exts = xr.enumerate_instance_extension_properties()
@@ -865,10 +978,6 @@ class XrRuntime:
 
         self.active_action_set = xr.ActiveActionSet(action_set=self.action_set, subaction_path=xr.NULL_PATH)
 
-    def _begin(self) -> None:
-        xr.begin_session(self.session, xr.SessionBeginInfo(primary_view_configuration_type=self.view_config_type))
-        self.environment_blend_mode = xr.EnvironmentBlendMode.OPAQUE
-
     def pump_sdl_events(self) -> bool:
         sdl_event = sdl2.SDL_Event()
         while sdl2.SDL_PollEvent(ctypes.byref(sdl_event)) != 0:
@@ -878,12 +987,76 @@ class XrRuntime:
                 return False
         return True
 
+    def _extract_session_state(self, ev) -> Optional[xr.SessionState]:
+        # Tries multiple pyopenxr representations
+        try:
+            # Some builds return an EventDataSessionStateChanged directly
+            if hasattr(ev, "state"):
+                return ev.state
+        except Exception:
+            pass
+
+        # EventDataBuffer casting attempt
+        try:
+            # If ev is EventDataBuffer-like, it should have a "type" field and be ctypes-backed
+            if hasattr(ev, "type") and int(ev.type) == int(xr.StructureType.EVENT_DATA_SESSION_STATE_CHANGED):
+                try:
+                    s = xr.EventDataSessionStateChanged.from_buffer(ev)  # if available
+                    return s.state
+                except Exception:
+                    try:
+                        s = ctypes.cast(ctypes.pointer(ev), ctypes.POINTER(xr.EventDataSessionStateChanged)).contents
+                        return s.state
+                    except Exception:
+                        return None
+        except Exception:
+            return None
+
+        return None
+
     def poll_xr_events(self) -> None:
+        # Proper session lifecycle handling (fixes "remove headset -> input dead until restart")
         while True:
             try:
-                xr.poll_event(self.instance)
+                ev = xr.poll_event(self.instance)
             except xr.exception.EventUnavailable:
                 break
+            except Exception:
+                break
+
+            st = self._extract_session_state(ev)
+            if st is not None:
+                self.session_state = st
+
+                if self.cfg.debug_inputs:
+                    print("[XR] Session state =", self.session_state)
+
+                # Begin session when READY
+                if self.session_state == xr.SessionState.READY and not self.session_running:
+                    try:
+                        xr.begin_session(self.session, xr.SessionBeginInfo(primary_view_configuration_type=self.view_config_type))
+                        self.session_running = True
+                        if self.cfg.debug_inputs:
+                            print("[XR] xrBeginSession()")
+                    except Exception as e:
+                        print("[XR][WARN] xrBeginSession failed:", repr(e))
+
+                # End session when STOPPING
+                elif self.session_state == xr.SessionState.STOPPING and self.session_running:
+                    try:
+                        xr.end_session(self.session)
+                        self.session_running = False
+                        if self.cfg.debug_inputs:
+                            print("[XR] xrEndSession()")
+                    except Exception as e:
+                        print("[XR][WARN] xrEndSession failed:", repr(e))
+
+                # Exit or loss pending -> quit loop
+                elif self.session_state in (xr.SessionState.EXITING, xr.SessionState.LOSS_PENDING):
+                    self.exit_requested = True
+
+            # Some runtimes can also request quit via instance-loss pending events,
+            # but we keep it simple here.
 
     def wait_begin_frame(self) -> xr.FrameState:
         frame_state = xr.wait_frame(self.session)
@@ -907,8 +1080,9 @@ class XrRuntime:
     def sync_actions(self) -> None:
         try:
             xr.sync_actions(self.session, xr.ActionsSyncInfo(active_action_sets=[self.active_action_set]))
-        except Exception:
-            pass
+        except Exception as e:
+            if self.cfg.debug_inputs:
+                print("[XR][WARN] sync_actions failed:", repr(e))
 
     def poll_inputs(self, predicted_time) -> InputState:
         inp = InputState()
@@ -932,8 +1106,9 @@ class XrRuntime:
             if inp.hand_pose_valid:
                 p = loc.pose.position
                 inp.hand_pos_world = (float(p.x), float(p.y), float(p.z))
-        except Exception:
-            pass
+        except Exception as e:
+            if self.cfg.debug_inputs:
+                print("[XR][WARN] poll_inputs failed:", repr(e))
 
         self._dbg_inputs(inp)
         return inp
@@ -970,14 +1145,18 @@ class XrRuntime:
         last["pose_valid"] = inp.hand_pose_valid
 
     def end_frame_empty(self, predicted_time) -> None:
-        xr.end_frame(
-            self.session,
-            xr.FrameEndInfo(display_time=predicted_time, environment_blend_mode=self.environment_blend_mode, layers=[]),
-        )
+        try:
+            xr.end_frame(
+                self.session,
+                xr.FrameEndInfo(display_time=predicted_time, environment_blend_mode=self.environment_blend_mode, layers=[]),
+            )
+        except Exception:
+            pass
 
     def shutdown(self) -> None:
         try:
-            xr.end_session(self.session)
+            if self.session_running:
+                xr.end_session(self.session)
         except Exception:
             pass
         try:
@@ -1011,7 +1190,7 @@ class XrRuntime:
 
 
 # ==========================================================
-# Genesis scene builder (edit here to change scene)
+# Genesis scene builder
 # ==========================================================
 @dataclass
 class GenesisHandles:
@@ -1173,7 +1352,7 @@ class App:
     def __init__(self, cfg: AppConfig):
         self.cfg = cfg
 
-        # 1) Genesis FIRST
+        # 1) Genesis FIRST (avoids context mismatch issues)
         self.g = build_genesis_scene(cfg)
 
         # 2) XR/GL AFTER Genesis is done
@@ -1185,6 +1364,9 @@ class App:
         # 3) Create GL resources in the OpenXR-bound context
         self.renderer = Renderer(cfg)
 
+        # 4) Spectator render target
+        self.spectator = Spectator2D(size=self.cfg.spectator_tex_size)
+
         self.teleop = TeleopController(cfg, self.g)
         self.extractor = GenesisProxyExtractor(cfg, self.renderer, self.g)
 
@@ -1192,8 +1374,44 @@ class App:
 
         print("[Config]")
         print("  Genesis version =", getattr(gs, "__version__", "unknown"))
-        print("  NOTE: Genesis built first; XR session created after.")
-        print("  If headset is black, this build restores glDrawBuffer/glReadBuffer on swapchain FBO.")
+        print("  Session lifecycle handling enabled (headset remove/put-back safe).")
+        print("  2D spectator screen enabled =", int(self.cfg.show_screen))
+
+    def _compute_screen_transform(self, head_R: np.ndarray, head_pos: np.ndarray) -> np.ndarray:
+        """
+        Build a world transform for the floating 2D screen:
+          - centered in front of HMD
+          - oriented facing the HMD
+          - scaled to desired physical size (meters)
+        """
+        forward = -(head_R @ np.array([0, 0, 1], dtype=np.float32))  # HMD forward (OpenXR -Z)
+        right = (head_R @ np.array([1, 0, 0], dtype=np.float32))
+        up = (head_R @ np.array([0, 1, 0], dtype=np.float32))
+
+        center = head_pos + forward * float(self.cfg.screen_distance_m) - up * float(self.cfg.screen_down_m)
+
+        # Make a basis that faces the user:
+        #   X axis = right
+        #   Y axis = up
+        #   Z axis = -forward (so quad's normal points toward the user)
+        Rw = np.stack([right, up, -forward], axis=1)
+
+        # Our plane mesh lies on XZ with normal +Y; rotate it so normal points +Z in its local space:
+        # We can do that by swapping axes: local +Y -> world +Z; easiest: apply a fixed rotation about X:
+        # rotate -90deg about X: (y->z)
+        Rx = np.array(
+            [
+                [1, 0, 0],
+                [0, 0, 1],
+                [0, -1, 0],
+            ],
+            dtype=np.float32,
+        )
+
+        Rfinal = Rw @ Rx
+
+        M = mat4_from_Rt(Rfinal, center) @ mat4_scale(float(self.cfg.screen_width_m), 1.0, float(self.cfg.screen_height_m))
+        return M
 
     def run(self) -> None:
         running = True
@@ -1206,24 +1424,43 @@ class App:
             if WGL.wglGetCurrentContext() != self.xr.hglrc:
                 sdl2.SDL_GL_MakeCurrent(self.xr.window, self.xr.gl_context)
 
+            # Poll OpenXR events (handles begin/end session)
             self.xr.poll_xr_events()
+
+            if self.xr.exit_requested:
+                break
+
+            # If session is not running, do not call xrWaitFrame.
+            # This is CRITICAL for correct behavior when you remove/put on headset.
+            if not self.xr.session_running:
+                time.sleep(0.01)
+                continue
+
             frame_state = self.xr.wait_begin_frame()
 
-            # Respect should_render when available
+            # Respect should_render when available (some runtimes set it false)
             if hasattr(frame_state, "should_render") and not frame_state.should_render:
                 self.xr.end_frame_empty(frame_state.predicted_display_time)
                 continue
-
-            self.xr.sync_actions()
-            inp = self.xr.poll_inputs(frame_state.predicted_display_time)
 
             views = self.xr.locate_views(frame_state.predicted_display_time)
             if views is None:
                 self.xr.end_frame_empty(frame_state.predicted_display_time)
                 continue
 
-            # Teleop + physics
-            self.teleop.update(inp)
+            # Only treat input as valid when focused (recommended)
+            focused = (self.xr.session_state == xr.SessionState.FOCUSED)
+
+            if focused:
+                self.xr.sync_actions()
+                inp = self.xr.poll_inputs(frame_state.predicted_display_time)
+            else:
+                inp = InputState()
+
+            # Teleop + physics (only if focused, so you don't get stale actions)
+            if focused:
+                self.teleop.update(inp)
+
             for _ in range(int(self.cfg.genesis_substeps_per_vr_frame)):
                 self.g.scene.step()
 
@@ -1232,6 +1469,15 @@ class App:
 
             # Shadow pass
             self.renderer.draw_shadow_pass(light_vp, shadow_items)
+
+            # Spectator 2D pass (render to texture)
+            if self.cfg.show_screen:
+                self.spectator.bind()
+                GL.glClearColor(0.05, 0.05, 0.06, 1.0)
+                GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
+                spec_vp = make_spectator_vp(self.cfg)
+                self.renderer.draw_main_pass(spec_vp, light_vp, main_items)
+                self.spectator.unbind()
 
             # Render per-eye
             proj_views = []
@@ -1245,7 +1491,7 @@ class App:
                 GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self.xr.fbo)
                 GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_COLOR_ATTACHMENT0, GL.GL_TEXTURE_2D, gl_image, 0)
 
-                # FIX: restore draw/read buffers after shadow pass set them to NONE
+                # IMPORTANT FIX: restore draw/read buffers after shadow pass set them to NONE
                 GL.glDrawBuffer(GL.GL_COLOR_ATTACHMENT0)
                 GL.glReadBuffer(GL.GL_COLOR_ATTACHMENT0)
 
@@ -1253,28 +1499,34 @@ class App:
                 GL.glRenderbufferStorage(GL.GL_RENDERBUFFER, GL.GL_DEPTH_COMPONENT24, w, h)
                 GL.glFramebufferRenderbuffer(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT, GL.GL_RENDERBUFFER, self.xr.depth_rb)
 
-                # Check FBO completeness once if something is off
                 if not self._printed_fbo_warn:
                     status = GL.glCheckFramebufferStatus(GL.GL_FRAMEBUFFER)
                     if status != GL.GL_FRAMEBUFFER_COMPLETE:
                         print("[WARN] Swapchain FBO incomplete:", hex(int(status)))
-                        self._printed_fbo_warn = True
+                    self._printed_fbo_warn = True
 
                 GL.glViewport(0, 0, w, h)
                 GL.glClearColor(0.07, 0.08, 0.10, 1.0)
                 GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT)
 
+                # Eye VP
                 P = openxr_projection_from_fov(views[eye_index].fov, near=self.cfg.near, far=self.cfg.far)
 
                 p = views[eye_index].pose.position
                 q = views[eye_index].pose.orientation
-                R = quat_xyzw_to_rotmat(np.array([q.x, q.y, q.z, q.w], dtype=np.float32))
-                tpos = np.array([p.x, p.y, p.z], dtype=np.float32)
+                head_R = quat_xyzw_to_rotmat(np.array([q.x, q.y, q.z, q.w], dtype=np.float32))
+                head_pos = np.array([p.x, p.y, p.z], dtype=np.float32)
 
-                V = mat4_inverse_rt(R, tpos)
+                V = mat4_inverse_rt(head_R, head_pos)
                 VP = P @ V
 
+                # Main scene
                 self.renderer.draw_main_pass(VP, light_vp, main_items)
+
+                # Floating 2D screen (spectator texture) - stays in your app => stays focused
+                if self.cfg.show_screen:
+                    M_screen = self._compute_screen_transform(head_R, head_pos)
+                    self.renderer.draw_screen_quad(VP, M_screen, self.spectator.tex)
 
                 GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
                 xr.release_swapchain_image(sc, xr.SwapchainImageReleaseInfo())
@@ -1292,7 +1544,7 @@ class App:
                     )
                 )
 
-            if self.cfg.swap_eyes:
+            if self.cfg.swap_eyes and len(proj_views) >= 2:
                 proj_views[0], proj_views[1] = proj_views[1], proj_views[0]
 
             proj_layer = xr.CompositionLayerProjection(
@@ -1301,14 +1553,19 @@ class App:
                 views=proj_views,
             )
 
-            xr.end_frame(
-                self.xr.session,
-                xr.FrameEndInfo(
-                    display_time=frame_state.predicted_display_time,
-                    environment_blend_mode=self.xr.environment_blend_mode,
-                    layers=[ctypes.pointer(proj_layer)],
-                ),
-            )
+            try:
+                xr.end_frame(
+                    self.xr.session,
+                    xr.FrameEndInfo(
+                        display_time=frame_state.predicted_display_time,
+                        environment_blend_mode=self.xr.environment_blend_mode,
+                        layers=[ctypes.pointer(proj_layer)],
+                    ),
+                )
+            except Exception as e:
+                # If end_frame fails due to lifecycle changes, events will drive stop/restart.
+                if self.cfg.debug_inputs:
+                    print("[XR][WARN] end_frame failed:", repr(e))
 
         self.xr.shutdown()
 
@@ -1320,6 +1577,8 @@ def main():
     cfg = AppConfig(
         genesis_backend="gpu",  # change to "cpu" if needed
         genesis_substeps_per_vr_frame=1,
+        spectator_tex_size=1024,
+        show_screen=True,
     )
     App(cfg).run()
 
