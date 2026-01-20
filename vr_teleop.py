@@ -9,11 +9,18 @@ Two-phase:
 
   Phase 2 (Genesis teleop):
     - Apply calibration: delta_sim = R @ delta_raw * scale
-    - Grab held => cube moves by calibrated hand delta
-    - Release => physics only
+    - Cube moves ONLY while grab button is HELD
+    - When button is NOT held, cube is released and physics takes over
 
 Capture action during calibration:
   - PRESS & HOLD TRIGGER (>0.8) for ~0.3s then release.
+
+Axis mapping after calibration (YOUR REQUEST):
+  - Physical RIGHT  -> +Y
+  - Physical LEFT   -> -Y
+  - Physical UP     -> +Z
+  - Physical DOWN   -> -Z
+  - Physical FWD/BACK is inferred as +X via right-handed basis
 """
 
 import os
@@ -204,11 +211,6 @@ class VrCalibrator:
     Runs XrRuntime and captures controller positions.
     Capture: trigger > 0.8 held ~0.3s then release.
     Stages: CENTER, RIGHT, LEFT, UP, DOWN.
-
-    IMPORTANT:
-      per_frame returns:
-        True  -> keep running
-        False -> request runtime loop to exit (so Genesis can start)
     """
     def __init__(self, debug=False):
         self.debug = debug
@@ -223,12 +225,9 @@ class VrCalibrator:
         self.done = False
         self.result = None
 
-        # NEW: reduce spam before pose exists
         self._have_pose = False
         self._printed_stage = -1
         self._last_no_pose_print = 0.0
-
-        # after finishing, keep running a few frames then exit
         self._exit_at = None
 
     def _stage_prompt(self):
@@ -246,48 +245,56 @@ class VrCalibrator:
         return f"Stage {s}: press trigger to capture."
 
     def _finalize(self):
-        center = self.captured["CENTER"]
         right = self.captured["RIGHT"]
         left = self.captured["LEFT"]
         up = self.captured["UP"]
         down = self.captured["DOWN"]
 
-        raw_x = _sub(right, left)   # physical RIGHT
-        raw_z = _sub(up, down)      # physical UP
+        # YOUR REQUESTED AXES:
+        #   physical RIGHT -> +Y
+        #   physical UP    -> +Z
+        raw_y = _sub(right, left)
+        raw_z = _sub(up, down)
 
-        basis = _orthonormalize(raw_x, raw_z)
+        basis = _orthonormalize(raw_y, raw_z)
         if basis is None:
             raise RuntimeError("Calibration failed: movements too small or vectors nearly collinear.")
 
-        raw_x_u, raw_y_u, raw_z_u = basis
+        # _orthonormalize returns (x_u, y_u, z_u) where:
+        #   x_u = normalize(first arg)
+        #   z_u = normalize(second arg)
+        #   y_u = cross(z_u, x_u)
+        #
+        # Here first arg = raw_y, second arg = raw_z, so:
+        #   returned_x_u == raw_y_u (RIGHT)
+        #   returned_z_u == raw_z_u (UP)
+        #   returned_y_u == inferred forward/back
+        raw_y_u, raw_x_u, raw_z_u = basis  # reorder to match sim axes X,Y,Z
 
-        # delta_sim = R @ delta_raw where R = B_raw^T
+        # delta_sim = R @ delta_raw where rows of R are sim basis in raw coords
         R = [
-            raw_x_u[0], raw_x_u[1], raw_x_u[2],
-            raw_y_u[0], raw_y_u[1], raw_y_u[2],
-            raw_z_u[0], raw_z_u[1], raw_z_u[2],
+            raw_x_u[0], raw_x_u[1], raw_x_u[2],  # sim +X (inferred fwd)
+            raw_y_u[0], raw_y_u[1], raw_y_u[2],  # sim +Y (physical right)
+            raw_z_u[0], raw_z_u[1], raw_z_u[2],  # sim +Z (physical up)
         ]
 
         self.result = CalibrationResult(R_row_major=R, scale=1.0)
         self.done = True
-        self._exit_at = time.time() + 0.6  # give time to print, then exit
+        self._exit_at = time.time() + 0.6
 
         print("\n[CALIB] Calibration complete.")
-        print("[CALIB] raw_x_u (physical RIGHT) =", raw_x_u)
-        print("[CALIB] raw_y_u (inferred FWD)    =", raw_y_u)
-        print("[CALIB] raw_z_u (physical UP)    =", raw_z_u)
+        print("[CALIB] raw_y_u (physical RIGHT -> +Y) =", raw_y_u)
+        print("[CALIB] raw_x_u (inferred FWD  -> +X)  =", raw_x_u)
+        print("[CALIB] raw_z_u (physical UP   -> +Z)  =", raw_z_u)
         print("[CALIB] Mapping: delta_sim = R @ delta_raw\n")
         print("[CALIB] Auto-starting Genesis...\n")
 
     def per_frame(self, actions: XrActionsState):
         now = time.time()
-
-        # if done, request exit after a short delay
         if self.done:
             return False if (self._exit_at is not None and now >= self._exit_at) else True
 
         cpos = _extract_controller_pos(actions, debug=False)
-
         if cpos is None:
             if self.debug and (now - self._last_no_pose_print) > 2.0:
                 print("[CALIB] Waiting for controller pose... (turn on controller / ensure tracking)")
@@ -301,7 +308,6 @@ class VrCalibrator:
             print("==============================")
             print("Capture by PRESS & HOLD TRIGGER (>0.8) ~0.3s then release.\n")
 
-        # Print stage prompt only when stage changes (no spam)
         if self.stage_i != self._printed_stage:
             self._printed_stage = self.stage_i
             print(f"\n[CALIB] Stage {self.stage_i+1}/{len(self.stage_names)}: {self.stage_names[self.stage_i]}")
@@ -417,8 +423,7 @@ class GenesisCubeTeleop:
         self._frame_i = 0
 
         if self.calib is not None:
-            R = torch.tensor(self.calib.R_row_major, device=self.device, dtype=torch.float32).view(3, 3)
-            self.R = R
+            self.R = torch.tensor(self.calib.R_row_major, device=self.device, dtype=torch.float32).view(3, 3)
             self.scale = float(self.calib.scale)
         else:
             self.R = None
@@ -471,6 +476,7 @@ class GenesisCubeTeleop:
             sim_delta = self._raw_to_sim_delta(raw_delta)
             return self.cube_grab_pos + sim_delta
 
+        # fallback nudges (ONLY if pose is missing while grabbed)
         step = 0.01
         dx = float(getattr(actions, "trigger", 0.0)) * step
         dy = (1.0 if getattr(actions, "button_a", False) else 0.0) * step
@@ -498,6 +504,37 @@ class GenesisCubeTeleop:
         elif hasattr(self.cube, "set_velocity"):
             self.cube.set_velocity((0.0, 0.0, 0.0))
 
+    def _grab_held(self, actions: XrActionsState, state: VrTeleopState) -> bool:
+        """
+        Returns True ONLY while the grab/side button is CONTINUOUSLY held.
+        """
+        # Prefer explicit side/grab button names if present
+        for name in ("side_button", "button_side", "grip_button", "button_grip"):
+            if hasattr(actions, name):
+                v = getattr(actions, name)
+                if isinstance(v, bool):
+                    return v
+                try:
+                    return float(v) > 0.5
+                except Exception:
+                    pass
+
+        # Analog squeeze/grip is common
+        for name in ("squeeze", "grip"):
+            if hasattr(actions, name):
+                try:
+                    if float(getattr(actions, name)) > 0.6:
+                        return True
+                except Exception:
+                    pass
+
+        # Mapper-provided held flags, if any
+        for name in ("grip_held", "grab_held", "teleop_held"):
+            if hasattr(state, name):
+                return bool(getattr(state, name))
+
+        return False
+
     def per_frame(self, actions: XrActionsState):
         self._frame_i += 1
         state = self.mapper.update(actions)
@@ -507,7 +544,9 @@ class GenesisCubeTeleop:
             debug_dump_actions(actions, heading="[DEBUG] FIRST FRAME ACTIONS DUMP")
             _extract_controller_pos(actions, debug=True)
 
-        if state.teleop_enabled and not self.last_state.teleop_enabled:
+        held = self._grab_held(actions, state)
+
+        if held and not self.grabbed:
             self.grabbed = True
             cube_pos, _ = self._get_pos_vel_torch()
 
@@ -528,13 +567,13 @@ class GenesisCubeTeleop:
                 self.fallback_target = cube_pos.clone()
                 print("[WARN] Grabbed but NO HAND POSE found -> fallback nudges will move cube.")
 
-            print("[CUBE] Grabbed (grip held)")
+            print("[CUBE] Grabbed (button held)")
 
-        if (not state.teleop_enabled) and self.last_state.teleop_enabled:
+        if (not held) and self.grabbed:
             self.grabbed = False
             self.hand_grab_raw = None
             self.cube_grab_pos = None
-            print("[CUBE] Released (grip released) - physics only")
+            print("[CUBE] Released (button up) - physics only")
 
         if self.grabbed:
             cpos = _extract_controller_pos(actions, debug=False)
@@ -543,7 +582,6 @@ class GenesisCubeTeleop:
 
             err = target - pos
             force = self.kp * err - self.kd * vel
-
             self._apply_force_or_fallback(force, target)
 
             if self.debug and (self._frame_i % 20 == 0):
@@ -579,7 +617,6 @@ def main():
         calib = run_calibration(debug=DEBUG_TELEOP)
         save_calibration(CALIB_PATH, calib)
 
-    # Phase 2: Genesis teleop
     teleop = GenesisCubeTeleop(show_viewer=True, debug=DEBUG_TELEOP, calib=calib)
     runtime = XrRuntime(window_title="VR Teleop + Genesis Cube (Calibrated Hand Delta)")
     try:
