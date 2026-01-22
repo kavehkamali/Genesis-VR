@@ -610,7 +610,7 @@ class GenesisCubeTeleop:
             print("[CUBE] Released (button up) - physics only")
 
         if self.grabbed:
-            cpos = _extract_controller_pos(actions, debug=False)
+            cpos = _extract_controller_pos(actions, debug=True)
             target = self._compute_target_torch(actions)
             pos, vel = self._get_pos_vel_torch()
 
